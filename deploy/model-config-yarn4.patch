@@ -1,0 +1,22 @@
+--- /models/dsv41/Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8/config.json.orig-262k	2026-10-23 20:14:28.985657386 -0400
++++ /models/dsv41/Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8/config.json	2026-10-23 21:14:28.205624706 -0400
+@@ -81,7 +81,7 @@
+         "linear_value_head_dim": 128,
+         "make_ngram_vocab_size_divisible_by": 128,
+         "mamba_ssm_dtype": "float32",
+-        "max_position_embeddings": 262144,
++        "max_position_embeddings": 1048576,
+         "model_type": "qwen4_exp_text",
+         "moe_intermediate_size": 640,
+         "mtp": {
+@@ -121,7 +121,9 @@
+             ],
+             "partial_rotary_factor": 0.25,
+             "rope_theta": 10000000,
+-            "rope_type": "default"
++            "rope_type": "yarn",
++            "factor": 4.0,
++            "original_max_position_embeddings": 262144
+         },
+         "router_aux_loss_coef": 0.001,
+         "shared_expert_intermediate_size": 640,

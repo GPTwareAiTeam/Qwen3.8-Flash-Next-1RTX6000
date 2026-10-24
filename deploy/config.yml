@@ -1,0 +1,38 @@
+network:
+  host: 127.0.0.1
+  port: 5000
+  disable_auth: true
+  api_servers: ["OAI"]
+  web_ui: false
+
+logging:
+  log_live_status: false
+  log_timestamps: true
+
+model:
+  model_dir: /models/dsv41
+  model_name: Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8
+  backend: exllamav3
+  max_seq_len: 1048576
+  cache_size: 2555904
+  cache_mode: 8,8
+  tensor_parallel: false
+  gpu_split_auto: false
+  gpu_split: [99]
+  max_batch_size: 8
+  chunk_size: 2048
+  ngram_ram: false
+  vision: true
+  vision_offload: false
+  warmup: true
+
+draft_model:
+  draft_mode: model
+  draft_model_dir: /models/dsv41/drafts
+  draft_model_name: Qwen3.8-Flash-Next-DFlash2
+  draft_num_tokens: 7        # DFlash2 block_size 8 -> 7 verified drafts (8 drafts = 9 verify positions, off the MAX_BSZN=8 path)
+  dynamic_draft: true
+  draft_confidence: 0.30
+
+sampling:
+  override_preset: qwen38_thinking
