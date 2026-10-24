@@ -1,5 +1,5 @@
---- /models/dsv41/Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8/config.json.orig-262k	2026-10-23 20:14:28.985657386 -0400
-+++ /models/dsv41/Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8/config.json	2026-10-23 21:14:28.205624706 -0400
+--- a/config.json
++++ b/config.json
 @@ -81,7 +81,7 @@
          "linear_value_head_dim": 128,
          "make_ngram_vocab_size_divisible_by": 128,
