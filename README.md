@@ -233,3 +233,10 @@ deploy/    launch.sh, config.yml as deployed, YaRN model-config patch
 bench/     the harnesses used for every number above
 docs/      measurement log, operations notes, router change
 ```
+
+## License
+
+This repository contains a deployment recipe, configuration, and benchmark harnesses — no model weights and
+no upstream source code. Those files are released under the MIT license. The components credited above keep
+their own licenses: exllamav3 (MIT), TabbyAPI (AGPL-3.0), the DFlash 2 drafter (Apache-2.0), and the
+Qwen3.8-Flash-Next weights (Qwen Community License 1.0, not redistributed here).
