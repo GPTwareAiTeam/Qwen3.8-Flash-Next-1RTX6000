@@ -231,7 +231,7 @@ change made to the local Model Router so that the DeepSeek and Qwen endpoints ap
 ```
 deploy/    launch.sh, config.yml as deployed, YaRN model-config patch
 bench/     the harnesses used for every number above
-docs/      measurement log, operations notes, router change
+docs/      measurement log, restore runbook, router change
 ```
 
 ## License
