@@ -1,9 +1,11 @@
-# Qwen3.8-Flash-Next on one RTX PRO 6000
+# Qwen3.8-Flash-Next on one RTX PRO 6000 — V2
 
 Serving recipe for `Qwen/Qwen3.8-Flash-Next` (EXL3 `3.18bpw_h6_ng8`) on a single 96 GiB RTX PRO 6000 Blackwell
 (SM120), with TabbyAPI, a patched exllamav3, the DFlash2 drafter and a 1M-token context.
 
-|Users|Baseline|This recipe|Change|
+This is V2. It improves on the original v1 recipe (stock exllamav3 1.6.4, 8-bit KV), the baseline in the tables below.
+
+|Users|v1|V2|Change|
 |---|---|---|---|
 |1|231.1 t/s|**299.4 t/s**|+29.5 %|
 |2|240.1|**398.0**|+65.8 %|
@@ -11,21 +13,21 @@ Serving recipe for `Qwen/Qwen3.8-Flash-Next` (EXL3 `3.18bpw_h6_ng8`) on a single
 |8|453.7|**676.7**|+49.1 %|
 |KV cache|2,555,904 tokens|**3,121,152 tokens**|+22.1 %|
 
-Baseline: stock exllamav3 1.6.4 with 8-bit KV and the same model, drafter and TabbyAPI. Both measured on the same
+v1: stock exllamav3 1.6.4 with 8-bit KV and the same model, drafter and TabbyAPI. Both measured on the same
 card, alternating A, A, B, B server boots, three runs per boot, medians; 512 generated tokens per request, greedy.
 
-|Decode, 2048 forced tokens from a short prompt|Baseline, greedy|This recipe, greedy|Change|This recipe, `qwen38_thinking` preset|
+|Decode, 2048 forced tokens from a short prompt|v1, greedy|V2, greedy|Change|V2, `qwen38_thinking` preset|
 |---|---|---|---|---|
 |prose|104.2 t/s|125.8 t/s|+20.7 %|117.8 t/s|
 |code|249.6|287.3|+15.1 %|263.6|
 |chat|122.8|156.1|+27.1 %|152.6|
 |math|260.9|313.8|+20.3 %|312.0|
 
-The preset column samples at the shipped defaults (temperature 0.6, top-k 20, top-p 0.95; `bench/decode_natural.py`
-with `SAMPLING=preset`, one run of three repeats). Sampled decode is 6-8 % slower than greedy on prose and code and
-about the same on chat and math.
+Greedy shown for comparison; the shipped qwen38_thinking preset (Qwen's recommended thinking-mode sampling) is 0–8 %
+slower because sampled tokens accept fewer drafts. The preset column samples at temperature 0.6, top-k 20, top-p 0.95
+(`bench/decode_natural.py` with `SAMPLING=preset`, one run of three repeats).
 
-Quality: 22/24 on the exact-answer probe (`bench/accuracy.py`, baseline 22/24); a planted fact 520k tokens deep is
+Quality: 22/24 on the exact-answer probe (`bench/accuracy.py`, v1 22/24); a planted fact 520k tokens deep is
 retrieved; 1.6 GiB of VRAM stays free at peak.
 
 ## What it takes
@@ -70,7 +72,7 @@ TABBY=$PWD/tabbyAPI ENGINE=$PWD/exllamav3 GPU=0 ./deploy/launch.sh
 `launch.sh` sets the engine switches, waits for the model and sends one 128-token warm-up request before serving
 (see "Server history").
 
-## What changed against the baseline
+## What changed against v1
 
 |Change|Where|Effect|Numerics|
 |---|---|---|---|
@@ -118,7 +120,7 @@ cold request can stall when the page cache is under pressure.
 **Server history.** With the drafter attached, a freshly started server's first ~74 decoded tokens can differ
 slightly from later requests; for example a raw `2+2=` as the very first request can complete with 5 instead of 4.
 The launcher's 128-token warm-up absorbs this. More generally, greedy text on this stack can depend slightly on
-what the server has decoded since start (near-tie tokens; next-token distributions are unaffected). The baseline
+what the server has decoded since start (near-tie tokens; next-token distributions are unaffected). v1
 behaves the same way.
 
 ## Repository
@@ -137,12 +139,15 @@ takes `SAMPLING=preset` to use the server's sampling preset instead of greedy.
 ## Credits
 
 - **Qwen3.8-Flash-Next**: Qwen team, Alibaba. Qwen Community License 1.0; weights are not redistributed here.
-- **exllamav3**: turboderp and contributors, MIT. EXL3 format, kernels, DFlash2 support.
+- **exllamav3**: turboderp and contributors, MIT. EXL3 format, kernels, DFlash2 support; V2's patches 0004, 0005
+  and 0007 extend its coop MoE kernels, CUDA-graph machinery and DFlash2 generator.
 - **TabbyAPI**: theroyallab and contributors, AGPL-3.0.
 - **DFlash2 drafter**: Inco AI / z-lab, Apache-2.0.
 - **flash-linear-attention**: Songlin Yang et al., MIT.
-- **QMesh R5** exllamav3 fork (GPTwareAiTeam, MIT): source of the MoE k-loop, readback-free dispatch, DGEMV and
-  prefill limiter ported here.
+- **QMesh R5** exllamav3 fork (GPTwareAiTeam, MIT), on which V2 builds: the cooperative MoE k-loop (0001), the dense
+  decode GEMV (0002), the readback-free fused MoE dispatch (0003) and the adaptive prefill limiter (0006) are ported
+  from it, as is the A, A, B, B / next-token-KL measurement method used for every number here.
+  <https://github.com/GPTwareAiTeam/QMesh-1xRTXPro6000-1xGB10>
 
 ## License
 
