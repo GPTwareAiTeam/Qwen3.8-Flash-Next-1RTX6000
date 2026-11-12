@@ -2,8 +2,8 @@
 
 `patches/` is a `git format-patch` series for
 [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) tag `v1.6.4`
-(`da68d57de61781e5b74ad68698ac4caf36408d7a`). The patched tree is the engine every V2/V2.1 number in the README
-was measured on.
+(`da68d57de61781e5b74ad68698ac4caf36408d7a`). The patched tree is the engine every number for this recipe in the
+README was measured on.
 
 ```bash
 git clone https://github.com/turboderp-org/exllamav3 && cd exllamav3

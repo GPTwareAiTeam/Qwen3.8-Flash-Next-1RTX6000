@@ -1,6 +1,7 @@
 import json,urllib.request,sys,re
 import os
 U=os.environ.get("BASE_URL","http://127.0.0.1:5000")+"/v1/completions"; M=os.environ.get("MODEL","Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8")
+HDR={"Content-Type":"application/json",**({"Authorization":"Bearer "+os.environ["API_KEY"]} if os.environ.get("API_KEY") else {})}
 ITEMS=[("2+2=","4"),("7*8=","56"),("17*23=","391"),("13*13=","169"),("144/12=","12"),("2**10=","1024"),
 ("37+48=","85"),("91-57=","34"),("sqrt(225)=","15"),("5!=","120"),
 ("What is the capital of France? Answer:","Paris"),("What is the capital of Japan? Answer:","Tokyo"),
@@ -15,7 +16,7 @@ ITEMS=[("2+2=","4"),("7*8=","56"),("17*23=","391"),("13*13=","169"),("144/12=","
 lab=sys.argv[1]; n=int(sys.argv[2]) if len(sys.argv)>2 else 768; ok=0; fails=[]
 for q,exp in ITEMS:
     b=json.dumps({"model":M,"prompt":q,"max_tokens":n,"temperature":0}).encode()
-    t=json.load(urllib.request.urlopen(urllib.request.Request(U,b,{"Content-Type":"application/json"}),timeout=600))["choices"][0]["text"]
+    t=json.load(urllib.request.urlopen(urllib.request.Request(U,b,HDR),timeout=600))["choices"][0]["text"]
     t=t.split("</think>")[-1] if "</think>" in t else t
     good = exp.lower() in t.lower()
     ok += good

@@ -11,8 +11,8 @@
 #   (the listen port is network.port in CONFIG; TabbyAPI ignores --port when a config file is given)
 #   WARMUP=0          skip the warm-up request (default 1)
 #   EXL3_NGRAM_LOCK=0 stream the engram table from disk instead of locking it in RAM (default 1)
-#   API_KEY=<key>     TabbyAPI API key for the readiness check and warm-up (needed unless disable_auth: true;
-#                     TabbyAPI writes it to api_tokens.yml in TABBY on first start)
+#   API_KEY=<key>     TabbyAPI API key for the readiness check and warm-up; default: api_key from
+#                     $TABBY/api_tokens.yml, which TabbyAPI creates on first start (unused with disable_auth: true)
 #
 # Warm-up: once /v1/models lists the model, one 128-token greedy completion is sent before the server is handed
 # over. With the DFlash2 drafter attached, a fresh server's numerics settle only after ~74 decoded tokens, so
@@ -38,6 +38,15 @@ case "$ENGINE" in /*) ;; *) echo "launch: ENGINE must be an absolute path (got $
 export CUDA_VISIBLE_DEVICES=$GPU
 export PYTHONPATH="$ENGINE${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-12.0}
+
+# exllamav3 imports any prebuilt exllamav3_ext it finds before JIT-building the patched sources. A pip-installed
+# exllamav3 in the environment would therefore run the patched Python against the unpatched extension.
+ext_path=$(cd / && PYTHONPATH="$ENGINE" "$PYTHON" -c 'import importlib.util as u; s=u.find_spec("exllamav3_ext"); print(s.origin if s and s.origin else "")' 2>/dev/null || true)
+case "$ext_path" in
+  ""|"$ENGINE"/*) ;;
+  *) echo "launch: a prebuilt exllamav3_ext outside ENGINE would shadow the patched build: $ext_path" >&2
+     echo "launch: pip uninstall exllamav3 (this recipe runs exllamav3 from ENGINE)" >&2; exit 2 ;;
+esac
 
 # Engram (n-gram embedding) table: 48.3 GiB. Locked in RAM by default, which needs memlock >= 50 GiB
 # (ulimit -l 52428800, or LimitMEMLOCK=52428800K in a systemd unit). With EXL3_NGRAM_LOCK=0 it is read from disk
@@ -78,10 +87,16 @@ wait_for() {
     sleep 2
   done
 }
+health_ok() { curl -fsS -m 5 "http://127.0.0.1:$PORT/health"; }
 models_ready() { curl -fsS -m 5 "http://127.0.0.1:$PORT/v1/models" ${API_KEY:+-H "Authorization: Bearer $API_KEY"} | grep -q "\"$MODEL_NAME\""; }
 
 if [ "$WARMUP" != "0" ]; then
   t0=$(date +%s)
+  wait_for /health health_ok
+  # With auth on and no API_KEY given, use the key TabbyAPI keeps in api_tokens.yml (it creates the file on first start)
+  if [ -z "${API_KEY:-}" ] && [ -f "$TABBY/api_tokens.yml" ]; then
+    API_KEY=$(sed -n 's/^api_key: *//p' "$TABBY/api_tokens.yml" | tr -d "\"'" | head -n1)
+  fi
   wait_for "/v1/models listing $MODEL_NAME" models_ready
   body=$(printf '{"model":"%s","prompt":"The capital of France is","max_tokens":128,"min_tokens":128,"temperature":0}' "$MODEL_NAME")
   if curl -fsS -m 300 -H 'Content-Type: application/json' ${API_KEY:+-H "Authorization: Bearer $API_KEY"} \

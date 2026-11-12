@@ -45,7 +45,8 @@ def post(prompt, model):
     req = urllib.request.Request(
         f"{BASE}/v1/completions",
         data=json.dumps({"model": model, "prompt": prompt, "max_tokens": 1, "temperature": 0}).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json",
+                 **({"Authorization": "Bearer " + os.environ["API_KEY"]} if os.environ.get("API_KEY") else {})},
     )
     t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=3600) as r:

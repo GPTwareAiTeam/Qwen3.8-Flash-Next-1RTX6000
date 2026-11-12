@@ -14,12 +14,16 @@ Serving recipe for `Qwen/Qwen3.8-Flash-Next` (EXL3 `3.18bpw_h6_ng8`) on a single
 Baseline: stock exllamav3 1.6.4 with 8-bit KV and the same model, drafter and TabbyAPI. Both measured on the same
 card, alternating A, A, B, B server boots, three runs per boot, medians; 512 generated tokens per request, greedy.
 
-|Decode, 2048 forced tokens from a short prompt|Baseline|This recipe|Change|
-|---|---|---|---|
-|prose|104.2 t/s|125.8 t/s|+20.7 %|
-|code|249.6|287.3|+15.1 %|
-|chat|122.8|156.1|+27.1 %|
-|math|260.9|313.8|+20.3 %|
+|Decode, 2048 forced tokens from a short prompt|Baseline, greedy|This recipe, greedy|Change|This recipe, `qwen38_thinking` preset|
+|---|---|---|---|---|
+|prose|104.2 t/s|125.8 t/s|+20.7 %|117.8 t/s|
+|code|249.6|287.3|+15.1 %|263.6|
+|chat|122.8|156.1|+27.1 %|152.6|
+|math|260.9|313.8|+20.3 %|312.0|
+
+The preset column samples at the shipped defaults (temperature 0.6, top-k 20, top-p 0.95; `bench/decode_natural.py`
+with `SAMPLING=preset`, one run of three repeats). Sampled decode is 6-8 % slower than greedy on prose and code and
+about the same on chat and math.
 
 Quality: 22/24 on the exact-answer probe (`bench/accuracy.py`, baseline 22/24); a planted fact 520k tokens deep is
 retrieved; 1.6 GiB of VRAM stays free at peak.
@@ -27,9 +31,12 @@ retrieved; 1.6 GiB of VRAM stays free at peak.
 ## What it takes
 
 - One RTX PRO 6000 Blackwell (96 GiB). Measured on the Max-Q (300 W) edition.
-- 64 GB of free host RAM for the engram table lock (or stream it from a fast NVMe, see below).
+- 50 GiB of lockable host RAM for the engram table (memlock ≥ 50 GiB; `launch.sh` checks it), or stream the table
+  from a fast NVMe instead (see below).
 - The model, about 100 GiB on disk, half of it the engram (n-gram embedding) table.
-- Python 3.12, PyTorch with CUDA 13 (measured on torch 2.11.0+cu130), flash-linear-attention 0.6.0.
+- Python 3.12, PyTorch 2.11 with CUDA 13 (`cu130` wheels), flash-linear-attention 0.6.0, the CUDA toolkit
+  (`nvcc`, for the extension's JIT build) and `ninja`. Use an environment without a pip-installed exllamav3: its
+  prebuilt extension would shadow the patched build (`launch.sh` refuses to start in that case).
 - [exllamav3](https://github.com/turboderp-org/exllamav3) `v1.6.4` + `engine/patches`.
 - [TabbyAPI](https://github.com/theroyallab/tabbyAPI) `564f8fb` + `deploy/tabbyapi-prefill-chunk-size.patch`.
 - Drafter: [`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2).
@@ -37,13 +44,19 @@ retrieved; 1.6 GiB of VRAM stays free at peak.
 ## Setup
 
 ```bash
+# environment
+python3.12 -m venv venv && . venv/bin/activate
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+
 # engine
 git clone https://github.com/turboderp-org/exllamav3 && cd exllamav3
-git checkout v1.6.4 && git am /path/to/repo/engine/patches/*.patch && cd ..
+git checkout v1.6.4 && git am /path/to/repo/engine/patches/*.patch
+pip install -r requirements.txt flash-linear-attention==0.6.0 && cd ..
 
 # server
 git clone https://github.com/theroyallab/tabbyAPI && cd tabbyAPI
 git checkout 564f8fb && git apply /path/to/repo/deploy/tabbyapi-prefill-chunk-size.patch
+pip install .
 cp /path/to/repo/deploy/sampler_overrides/qwen38_thinking.yml sampler_overrides/ && cd ..
 
 # 1M context: apply the YaRN factor-4 change to the model's config.json
@@ -67,7 +80,7 @@ TABBY=$PWD/tabbyAPI ENGINE=$PWD/exllamav3 GPU=0 ./deploy/launch.sh
 |Verify windows up to 64 rows through the coop MoE kernels|patch 0004, `EXL3_MOE_COOP_ROWS=64`|8 users +20 %|same next-token distributions|
 |Shared expert on a side stream, overlapping the routed experts|patch 0007, `EXL3_MOE_SHARED_SIDE=1`|1 user +6 %, 8 users +12 %|bit-identical|
 |DFlash2 drafter layers as one CUDA graph|patch 0005, `EXL3_DFLASH_GRAPH=1`|8 users +4 %, code +5 %|lossless|
-|Draft confidence 0.30 → 0.45|config|1 user +5.5 %, 8 users +3.9 %|lossless|
+|Draft confidence 0.30 → 0.45|config|1 user +5.5 %, 8 users +3.9 %|changes greedy text on near-ties; same next-token distributions|
 |Engram table locked in RAM (`EXL3_NGRAM_LOCK=1`)|launch.sh|removes a 16 s first-request stall on cold 32k prompts (8.7 s worst case after); boot +15 s|lossless|
 
 Each row was measured as an A/B against the step before it. Ports from the
@@ -116,7 +129,10 @@ engine/   exllamav3 patch series and its README
 bench/    the harnesses behind the tables (matrix, decode, accuracy, cold time-to-first-token)
 ```
 
-Run the benchmarks against a running server: `BASE_URL=http://127.0.0.1:5000 python bench/matrix.py`.
+Run the benchmarks against a running server, e.g.
+`BASE_URL=http://127.0.0.1:5000 API_KEY=<api_key from tabbyAPI/api_tokens.yml> python bench/matrix.py`.
+`matrix.py` takes `CONC`, `REPS` and `SECTIONS` (e.g. `CONC=1 REPS=1 SECTIONS=concurrency`); `decode_natural.py`
+takes `SAMPLING=preset` to use the server's sampling preset instead of greedy.
 
 ## Credits
 
@@ -130,5 +146,6 @@ Run the benchmarks against a running server: `BASE_URL=http://127.0.0.1:5000 pyt
 
 ## License
 
-MIT for the recipe, scripts and patches (the patches modify MIT-licensed exllamav3). The linked components keep
-their own licenses.
+The recipe, scripts and `engine/patches` are MIT (the engine patches modify MIT-licensed exllamav3).
+`deploy/tabbyapi-prefill-chunk-size.patch` modifies AGPL-3.0 TabbyAPI and is therefore AGPL-3.0. The linked
+components keep their own licenses.
