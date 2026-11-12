@@ -1,0 +1,58 @@
+diff --git a/backends/exllamav3/model.py b/backends/exllamav3/model.py
+index 51c7352..50ec0cb 100644
+--- a/backends/exllamav3/model.py
++++ b/backends/exllamav3/model.py
+@@ -256,6 +256,7 @@ class ExllamaV3Container:
+     recurrent_state_fp32: bool = False
+     draft_cache_mode: str = "FP16"
+     chunk_size: int = 2048
++    prefill_chunk_size: int = 2048
+     max_rq_tokens: Optional[int] = 2048
+     max_batch_size: Optional[int] = None
+     draft_num_tokens: Optional[int] = None
+@@ -626,6 +627,15 @@ class ExllamaV3Container:
+         user_chunk_size = unwrap(kwargs.get("chunk_size"), 2048)
+         self.chunk_size = self.adjust_chunk_size(user_chunk_size)
+ 
++        # Prefill chunk cap for the generator. Load-time measuring, warmup and output chunking stay sized by
++        # chunk_size; the generator may ingest prompts in chunks up to prefill_chunk_size, shrunk per chunk to
++        # free memory by exllamav3's adaptive limiter (EXL3_PREFILL_ADAPTIVE)
++        user_prefill_chunk = unwrap(kwargs.get("prefill_chunk_size"), None)
++        self.prefill_chunk_size = max(
++            self.chunk_size,
++            self.adjust_chunk_size(user_prefill_chunk) if user_prefill_chunk else self.chunk_size,
++        )
++
+         # Output chunking
+         output_chunking = unwrap(kwargs.get("output_chunking"), True)
+         self.max_rq_tokens = self.chunk_size if output_chunking else None
+@@ -1226,7 +1236,7 @@ class ExllamaV3Container:
+                 draft_cache=self.draft_cache,
+                 tokenizer=self.tokenizer,
+                 max_batch_size=self.max_batch_size,
+-                max_chunk_size=self.chunk_size,
++                max_chunk_size=self.prefill_chunk_size,
+                 recurrent_cache_size=config.memory.sysmem_recurrent_cache * 1024**2,
+                 cpu_cache_size=config.memory.sysmem_kv_cache * 1024**2,
+                 num_draft_tokens=self.draft_num_tokens,
+diff --git a/common/config_models.py b/common/config_models.py
+index 1d5f51b..d19dbe5 100644
+--- a/common/config_models.py
++++ b/common/config_models.py
+@@ -405,6 +405,16 @@ class ModelConfig(BaseConfigModel):
+         ),
+         gt=0,
+     )
++    prefill_chunk_size: Optional[int] = Field(
++        None,
++        description=(
++            "Upper bound on prompt-ingestion chunks (default: None = chunk_size).\n"
++            "Load-time sizing, warmup and output chunking keep using chunk_size; the\n"
++            "generator ingests prompts in chunks up to this size, shrunk per chunk to\n"
++            "free VRAM by exllamav3's adaptive limiter (EXL3_PREFILL_ADAPTIVE=1)."
++        ),
++        gt=0,
++    )
+     output_chunking: Optional[bool] = Field(
+         True,
+         description=(

@@ -1,0 +1,469 @@
+From 1ab7ca2b4a57ad42d3347079653ad00ac8b7f34a Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:23:40 -0500
+Subject: [PATCH 7/7] MoE: shared expert on a side stream
+ (EXL3_MOE_SHARED_SIDE); DGEMV per-device workspace
+
+The shared expert runs on a high-priority side stream and joins before the routed down projection. Bit-identical; c1 +6 %, c8 +12 %. DGEMV now uses one small workspace per device (EXL3_DGEMV_WS_MB, default 4) instead of 64 MiB per (device, stream). Drops a DGEMV test assertion that measured torch's CUDA-graph pool rather than DGEMV.
+---
+ exllamav3/exllamav3_ext/bindings.cpp          |  1 +
+ .../libtorch/blocksparse_mlp.cpp              | 80 +++++++++++++++++--
+ .../exllamav3_ext/libtorch/blocksparse_mlp.h  | 16 ++++
+ exllamav3/exllamav3_ext/quant/exl3_dgemv.cu   | 50 ++++++++----
+ .../exllamav3_ext/quant/exl3_dgemv_kernel.cuh | 18 ++++-
+ .../exllamav3_ext/quant/exl3_moe_coop.cu      | 10 ++-
+ .../exllamav3_ext/quant/exl3_moe_coop.cuh     |  7 +-
+ tests/kernels/gemm/test_exl3_dgemv.py         | 52 ++++++++++++
+ 8 files changed, 202 insertions(+), 32 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index 4605b0cb..2ee83929 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -229,6 +229,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("exl3_dgemv_enabled", &exl3_dgemv_enabled, "exl3_dgemv_enabled");
+     m.def("exl3_dgemv_has", &exl3_dgemv_has, "exl3_dgemv_has");
+     m.def("exl3_dgemv_set_enabled", &exl3_dgemv_set_enabled, "exl3_dgemv_set_enabled");
++    m.def("exl3_moe_shared_side_set", &exl3_moe_shared_side_set, "exl3_moe_shared_side_set");
+     m.def("exl3_dgemv_splits_for", &exl3_dgemv_splits_for, "exl3_dgemv_splits_for");
+ #endif
+     m.def("rope", &rope, "rope");
+diff --git a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
+index 9daef29e..fba04e4c 100644
+--- a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
+@@ -2,7 +2,10 @@
+ #include "blocksparse_mlp.h"
+ #include <c10/cuda/CUDAGuard.h>
+ #include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAStream.h>
+ #include <torch/extension.h>
++#include <map>
++#include <mutex>
+ #include "../util.h"
+ #include "../hgemm.cuh"
+ #include "../quant/exl3_gemm.cuh"
+@@ -103,20 +106,83 @@ void BC_BlockSparseMLP::run_bszN
+     }
+     else if (shared_experts)
+     {
+-        // The shared expert's multi-row graph covers MAX_BSZN rows: wider verify windows run it in pieces
+-        for (int start = 0; start < num_tokens; start += MAX_BSZN)
++        // EXL3_MOE_SHARED_SIDE=1: the shared expert's graph runs on a high-priority side stream, concurrent with the
++        // routed rotation + gate/up launch (it only reads y and writes its own scratch and out_d_sh); the routed down
++        // launch, which merges out_d_sh, waits for it. Same kernels on the same inputs, same merge: bit-identical.
++        // Not while the caller's stream is capturing (the fork would have to join inside the outer capture)
++        cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++        cudaEvent_t join = nullptr;
++        if (sh_side_enabled())
+         {
+-            const int end = std::min(start + MAX_BSZN, num_tokens);
+-            at::Tensor x_dense = y.slice(0, start, end).unsqueeze(0);
+-            at::Tensor out_piece = out_d_sh.value().slice(1, start, end);
+-            shared_experts->run_bszN(x_dense, out_piece);
++            cudaStreamCaptureStatus cap;
++            AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
++            if (cap == cudaStreamCaptureStatusNone)
++            {
++                cudaStream_t side = sh_side_stream(y.device().index());
++                if (!sh_fork)
++                {
++                    AT_CUDA_CHECK(cudaEventCreateWithFlags(&sh_fork, cudaEventDisableTiming));
++                    AT_CUDA_CHECK(cudaEventCreateWithFlags(&sh_join, cudaEventDisableTiming));
++                }
++                AT_CUDA_CHECK(cudaEventRecord(sh_fork, stream));
++                AT_CUDA_CHECK(cudaStreamWaitEvent(side, sh_fork, 0));
++                {
++                    c10::cuda::CUDAStreamGuard sg(c10::cuda::getStreamFromExternal(side, y.device().index()));
++                    run_shared_pieces(y, num_tokens);
++                }
++                AT_CUDA_CHECK(cudaEventRecord(sh_join, side));
++                join = sh_join;
++            }
+         }
++        if (!join) run_shared_pieces(y, num_tokens);
+         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
+-        sh_o = out_d_sh_n;
++        exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, out_d_sh_n, join);
++        return;
+     }
+     exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
+ }
+ 
++void BC_BlockSparseMLP::run_shared_pieces(const at::Tensor& y, int num_tokens)
++{
++    // The shared expert's multi-row graph covers MAX_BSZN rows: wider verify windows run it in pieces
++    for (int start = 0; start < num_tokens; start += MAX_BSZN)
++    {
++        const int end = std::min(start + MAX_BSZN, num_tokens);
++        at::Tensor x_dense = y.slice(0, start, end).unsqueeze(0);
++        at::Tensor out_piece = out_d_sh.value().slice(1, start, end);
++        shared_experts->run_bszN(x_dense, out_piece);
++    }
++}
++
++// -1: the env (EXL3_MOE_SHARED_SIDE, default off); exl3_moe_shared_side_set(0 / 1) overrides it (tests, benches)
++static int sh_side_override = -1;
++
++void exl3_moe_shared_side_set(int mode) { sh_side_override = mode; }
++
++bool BC_BlockSparseMLP::sh_side_enabled()
++{
++    if (sh_side_override >= 0) return sh_side_override != 0;
++    static const bool on = std::getenv("EXL3_MOE_SHARED_SIDE") && atoi(std::getenv("EXL3_MOE_SHARED_SIDE")) != 0;
++    return on;
++}
++
++cudaStream_t BC_BlockSparseMLP::sh_side_stream(int device)
++{
++    // One side stream per device for every MoE layer (their shared experts share scratch: layer order on one stream),
++    // at the greatest priority so its few blocks are scheduled ahead of the routed launch's remaining waves
++    static std::mutex mtx;
++    static std::map<int, cudaStream_t> streams;
++    std::lock_guard<std::mutex> lock(mtx);
++    auto it = streams.find(device);
++    if (it != streams.end()) return it->second;
++    int lo, hi;
++    AT_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
++    cudaStream_t s;
++    AT_CUDA_CHECK(cudaStreamCreateWithPriority(&s, cudaStreamNonBlocking, hi));
++    streams[device] = s;
++    return s;
++}
++
+ #if defined(USE_ROCM)
+ // RDNA route of run_bszN: four launches through exl3_rocm_moe_decode into out_d2, then the shared expert (its
+ // own multi-row graph, merged through the sigmoid gate when there is one, as the fused kernels do) and the copy
+diff --git a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.h b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.h
+index 82e4a42d..0b0c43c4 100644
+--- a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.h
++++ b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.h
+@@ -21,6 +21,8 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
+     const py::dict& params
+ );
+ 
++void exl3_moe_shared_side_set(int mode);
++
+ struct BC_BlockSparseMLP
+ {
+     at::Tensor yh2;
+@@ -95,6 +97,12 @@ struct BC_BlockSparseMLP
+     std::vector<at::Tensor> sh_tables;      // int64 pointer tables (one expert) and scratch, kept alive
+     at::Tensor sh_sel, sh_rw;               // (MAX_BSZN, 1): expert 0, weight 1
+ 
++    // EXL3_MOE_SHARED_SIDE: shared-expert graph on a side stream, joined before the routed down launch
++    cudaEvent_t sh_fork = nullptr, sh_join = nullptr;
++    void run_shared_pieces(const at::Tensor& y, int num_tokens);
++    static bool sh_side_enabled();
++    static cudaStream_t sh_side_stream(int device);
++
+ #if defined(USE_ROCM)
+     // RDNA fused decode (rocm/quant/exl3_gemv_multirow_rdna.cu, exl3_rocm_moe_decode): taken by run_bszN
+     // for gated SiLU experts without biases or expert-range masking; anything else keeps the kernels above
+@@ -171,6 +179,14 @@ struct BC_BlockSparseMLP
+         bool _sh_coop = false
+     );
+ 
++    ~BC_BlockSparseMLP()
++    {
++        if (sh_fork) cudaEventDestroy(sh_fork);
++        if (sh_join) cudaEventDestroy(sh_join);
++    }
++    BC_BlockSparseMLP(const BC_BlockSparseMLP&) = delete;
++    BC_BlockSparseMLP& operator=(const BC_BlockSparseMLP&) = delete;
++
+     void run_bszN
+     (
+         const at::Tensor& y,
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
+index 5c1df391..85d5fa8e 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
+@@ -32,12 +32,26 @@ matrix's (rows, k, n) (exl3_dgemv_ns::splits_for): ~EXL3_DGEMV_TARGET_BLOCKS blo
+ matrix produces the same bits alone or inside a fan, and the partials are summed in split order (no
+ float atomics): deterministic for a given shape.
+ 
+-Workspace: fixed per (device, stream), allocated on first use and never reallocated (the pointer is
+-baked into captured graphs). Counters at its head self-reset; partials follow, one fixed slab per
+-multi-matrix slot.
++Workspace: one per device, EXL3_DGEMV_WS_MB (default 4) MiB of partials after the counters, allocated on
++first use and never reallocated (the pointer is baked into captured graphs). Counters at its head
++self-reset; partials follow, one slab per multi-matrix slot. A call whose partials do not fit takes the
++vendor path (a shape property, so the choice is fixed per shape). One workspace per device means DGEMV
++launches on one device must not run concurrently: the engine issues them in stream order on the compute
++stream (graph captures record on their capture stream but replay on the compute stream), and
++EXL3_MOE_SHARED_SIDE overlaps the shared expert only with the routed coop kernels, never with another
++dense GEMV. Per (device, stream) keys grew one 64 MiB slab per capture stream (graph.cu makes one per
++capture), the out-of-memory at the max KV pool.
+ */
+ 
+-#define DGEMV_WS_BYTES (EXL3_DGEMV_CNT_INTS * 4 + EXL3_DGEMV_MAX_SLOTS * EXL3_DGEMV_SLOT_FLOATS * 4)
++static int64_t ws_partial_floats()
++{
++    static const int64_t f = [] {
++        const char* e = std::getenv("EXL3_DGEMV_WS_MB");
++        const int mb = e ? atoi(e) : 4;
++        return (int64_t) (mb > 0 ? mb : 4) * 1024 * 1024 / 4;
++    }();
++    return f;
++}
+ 
+ // 0 off, 1 measured envelope (default), 2 every hard-eligible call (testing). exl3_dgemv_set_enabled
+ // overrides the env (-1 restores it)
+@@ -76,31 +90,29 @@ bool exl3_dgemv_has(int K, int cb, int size_m, bool c_fp32)
+     return select_kernel(K, MT, c_fp32, false) && select_kernel(K, MT, c_fp32, true);
+ }
+ 
+-// One workspace per (device, stream): two streams may run dense GEMMs concurrently (the P7 compute stream
+-// and the head stream), and the self-resetting counters and partials must not be shared between them.
+-// The pointer is baked into captured graphs, so a buffer lives for the process. First use may be inside
+-// a capture (graphs capture on their own stream): the allocation then runs in relaxed capture mode and
+-// the counters are zeroed on a private non-blocking stream, neither of which is captured
+-static int* get_ws(int device, cudaStream_t stream)
++// One workspace per device (see the header comment). The pointer is baked into captured graphs, so it
++// lives for the process. First use may be inside a capture (graphs capture on their own stream): the
++// allocation then runs in relaxed capture mode and the counters are zeroed on a private non-blocking
++// stream, neither of which is captured
++static int* get_ws(int device)
+ {
+     static std::mutex mtx;
+-    static std::map<std::pair<int, cudaStream_t>, int*> ws;
++    static std::map<int, int*> ws;
+     std::lock_guard<std::mutex> lock(mtx);
+-    auto key = std::make_pair(device, stream);
+-    auto it = ws.find(key);
++    auto it = ws.find(device);
+     if (it != ws.end()) return it->second;
+ 
+     cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+     cuda_check(cudaThreadExchangeStreamCaptureMode(&mode));
+     int* p;
+-    cuda_check(cudaMalloc(&p, DGEMV_WS_BYTES));
++    cuda_check(cudaMalloc(&p, EXL3_DGEMV_CNT_INTS * sizeof(int) + ws_partial_floats() * sizeof(float)));
+     cudaStream_t init;
+     cuda_check(cudaStreamCreateWithFlags(&init, cudaStreamNonBlocking));
+     cuda_check(cudaMemsetAsync(p, 0, EXL3_DGEMV_CNT_INTS * sizeof(int), init));
+     cuda_check(cudaStreamSynchronize(init));
+     cuda_check(cudaStreamDestroy(init));
+     cuda_check(cudaThreadExchangeStreamCaptureMode(&mode));
+-    ws[key] = p;
++    ws[device] = p;
+     return p;
+ }
+ 
+@@ -171,8 +183,9 @@ void* exl3_dgemv_try_launch
+     TORCH_CHECK(kernel, "exl3_dgemv: no instance for K=", K, " rows=", size_m);
+     int splits = exl3_dgemv_ns::splits_for(size_m, size_k, size_n);
+     TORCH_CHECK(size_n / 128 <= EXL3_DGEMV_CNT_INTS, "exl3_dgemv: too many column blocks");
++    if (exl3_dgemv_ns::slot_floats(size_m, size_k, size_n, false) > ws_partial_floats()) return nullptr;
+ 
+-    int* ws = get_ws(device, stream);
++    int* ws = get_ws(device);
+     void* args[10];
+     for (int i = 0; i < 10; ++i) args[i] = kernel_args[i];
+     args[6] = (void*) &ws;
+@@ -203,6 +216,9 @@ void* exl3_dmgemv_try_launch
+         int64_t total = (int64_t) slots * size_k * size_n;
+         if (size_m > 32 || total > 14 * 1024 * 1024) return nullptr;
+     }
++    // size_n_list is kernel_args[17] (EXL3_MGEMM_ARGS order, exl3_gemm.cu kernelArgs)
++    const bool width_list = *(const void* const*) kernel_args[17] != nullptr;
++    if ((int64_t) slots * exl3_dgemv_ns::slot_floats(size_m, size_k, size_n, width_list) > ws_partial_floats()) return nullptr;
+     int MT = CEIL_DIVIDE(size_m, 16);
+     void* kernel = select_kernel(K, MT, c_fp32, true);
+     TORCH_CHECK(kernel, "exl3_dmgemv: no instance for K=", K, " rows=", size_m);
+@@ -210,7 +226,7 @@ void* exl3_dmgemv_try_launch
+     // every n <= size_n, so this grid covers every slot (blocks past a slot's own count exit at once)
+     int grid_x = MIN(EXL3_DGEMV_TARGET_BLOCKS - 1 + ncb, ncb * (size_k / 128));
+ 
+-    int* ws = get_ws(device, stream);
++    int* ws = get_ws(device);
+     void* args[22];
+     for (int i = 0; i < 22; ++i) args[i] = kernel_args[i];
+     args[6] = (void*) &ws;
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh
+index b23e4bc8..adfaa5a9 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh
+@@ -38,7 +38,7 @@
+ #define EXL3_DGEMV_TARGET_BLOCKS 256    // blocks per matrix the split rule aims for (RTX PRO 6000: 188 SMs)
+ #endif
+ #define EXL3_DGEMV_MAX_SLOTS 8          // matrices per multi-matrix launch
+-#define EXL3_DGEMV_SLOT_FLOATS (2 * 1024 * 1024)   // partials per matrix (8 MB): 48 rows x 5120 x 8 splits
++#define EXL3_DGEMV_SLOT_FLOATS (2 * 1024 * 1024)   // split-count cap: partials per matrix at most 8 MB (layout: slot_floats)
+ #define EXL3_DGEMV_A_STRIDE 136         // halves per staged input row: 128 + 8 keeps fragment reads conflict-free
+ 
+ namespace exl3_dgemv_ns {
+@@ -63,6 +63,18 @@ __host__ __device__ __forceinline__ int splits_for(int size_m, int size_k, int s
+     return (kgroups + kw - 1) / kw;
+ }
+ 
++// Partials of one matrix (m rows x n columns x its k splits). Multi-matrix launches lay the slots out at the largest
++// slot's size: exact when every slot has the launch's width (no width list), else a bound over all widths
++// n_j <= size_n: n_j * splits_for(n_j) <= min(n_j * ceil(TARGET / ncb_j), n_j * kgroups)
++// <= min(128 * (TARGET - 1) + size_n, size_n * kgroups)
++__host__ __device__ __forceinline__ int64_t slot_floats(int size_m, int size_k, int size_n, bool width_list)
++{
++    if (!width_list) return (int64_t) size_m * size_n * splits_for(size_m, size_k, size_n);
++    const int64_t a = 128 * (EXL3_DGEMV_TARGET_BLOCKS - 1) + size_n;
++    const int64_t b = (int64_t) size_n * (size_k / 128);
++    return (int64_t) size_m * (a < b ? a : b);
++}
++
+ extern __shared__ int4 dgemv_smem[];
+ 
+ template <int bits, int cb, int MT, bool c_fp32>
+@@ -283,7 +295,7 @@ void exl3_dgemv_kernel(EXL3_GEMM_ARGS)
+ // size_n_list[mat] (or C[j] at size_n), and splits_for(size_m, size_k, its width) k splits, exactly as
+ // a single-matrix launch would. Grid x: the largest ncb * splits over the slots (host computed); blocks
+ // past a slot's own count exit. Slot j owns counters [j * CNT_INTS / MAX_SLOTS, +CNT_INTS / MAX_SLOTS)
+-// and partials [j * SLOT_FLOATS, +SLOT_FLOATS). Unweighted, unfiltered, single-token, unsliced only
++// and partials [j * slot_floats, +slot_floats). Unweighted, unfiltered, single-token, unsliced only
+ // (checked by the host)
+ template <int bits, int cb, int MT, bool c_fp32>
+ __global__ __launch_bounds__(EXL3_DGEMV_THREADS)
+@@ -305,7 +317,7 @@ void exl3_dmgemv_kernel(EXL3_MGEMM_ARGS)
+     else if constexpr (c_fp32) C_j = (void*) (((float*) C) + (size_t) j * size_m * size_n);
+     else                       C_j = (void*) (((half*) C) + (size_t) j * size_m * size_n);
+ 
+-    float* ws = (float*) (locks + EXL3_DGEMV_CNT_INTS) + (size_t) j * EXL3_DGEMV_SLOT_FLOATS;
++    float* ws = (float*) (locks + EXL3_DGEMV_CNT_INTS) + (size_t) j * exl3_dgemv_ns::slot_floats(size_m, size_k, size_n, size_n_list != nullptr);
+     int* cnt = locks + j * (EXL3_DGEMV_CNT_INTS / EXL3_DGEMV_MAX_SLOTS);
+ 
+     exl3_dgemv_ns::body<bits, cb, MT, c_fp32>
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+index 8e7fa97e..5364265d 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+@@ -132,13 +132,15 @@ static void moe_coop_smem_optin(void* kernel, int smem)
+     done[kernel] = smem;
+ }
+ 
+-void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream)
++void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
++                          cudaEvent_t wait_b)
+ {
+     MoeCoopParams p = p_in;
+     { static int dbg = std::getenv("EXL3_MOE_COOP_DBG") ? atoi(std::getenv("EXL3_MOE_COOP_DBG")) : 0; p.dbg = dbg; }
+     const int slots = p.bsz * p.topk;
+     if (!slots)
+     {
++        if (wait_b) cuda_check(cudaStreamWaitEvent(stream, wait_b, 0));
+         if (p.bsz && p.H_out)
+         {
+             exl3_moe_coop_empty_kernel<<<dim3(p.bsz, CEIL_DIVIDE(p.H_out, 128)), 32, 0, stream>>>(p);
+@@ -172,6 +174,7 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, float K_gu, float K_d, int
+         exl3_moe_coop_ns::exl3_moe_coop_rot_kernel<<<rot_grid, MOE_COOP_THREADS, 0, stream>>>(p);
+     }
+     cuda_check(cudaLaunchKernel(ka.kernel, dim3(grid_a), dim3(MOE_COOP_THREADS), args, ka.smem, stream));
++    if (wait_b) cuda_check(cudaStreamWaitEvent(stream, wait_b, 0));
+     cuda_check(cudaLaunchKernel(kb.kernel, dim3(grid_b), dim3(MOE_COOP_THREADS), args, kb.smem, stream));
+     cuda_check(cudaPeekAtLastError());
+ }
+@@ -299,7 +302,8 @@ void exl3_moe_coop_run
+ (
+     MoeCoopParams p, float K_gu, float K_d, int cb,
+     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
+-    const c10::optional<at::Tensor>& sh_out
++    const c10::optional<at::Tensor>& sh_out,
++    cudaEvent_t wait_b
+ )
+ {
+     const at::cuda::OptionalCUDAGuard device_guard(x.device());
+@@ -327,7 +331,7 @@ void exl3_moe_coop_run
+     }
+     else
+         p.sh_gate_w = nullptr;
+-    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream);
++    exl3_moe_coop_launch(p, K_gu, K_d, cb, device, stream, wait_b);
+ }
+ 
+ void exl3_moe_coop
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+index cc9fade0..c50283ba 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+@@ -88,7 +88,9 @@ struct MoeCoopParams
+ // Launch with plain device pointers (called from BC_BlockSparseMLP). K: gate/up and down bit
+ // widths (gate and up always share one, the converter allocates them as one group); cb: 0 default,
+ // 1 mcg, 2 mul1 codebook, uniform across the three projections
+-void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream);
++// wait_b: optional event the down launch waits on (the shared expert computed on a side stream; B merges sh_out)
++void exl3_moe_coop_launch(const MoeCoopParams& p, float K_gu, float K_d, int cb, int device, cudaStream_t stream,
++                          cudaEvent_t wait_b = nullptr);
+ 
+ // Static part of the parameter block, validated once from the module's tensors (BC construction);
+ // K_gu / K_d / cb come back through the out-params. Gate tables/scratch are ignored when
+@@ -124,7 +126,8 @@ void exl3_moe_coop_run
+ (
+     MoeCoopParams p, float K_gu, float K_d, int cb,
+     const at::Tensor& x, const at::Tensor& sel, const at::Tensor& rw,
+-    const c10::optional<at::Tensor>& sh_out
++    const c10::optional<at::Tensor>& sh_out,
++    cudaEvent_t wait_b = nullptr
+ );
+ 
+ // Tensor front end (prepare + run; the test entry point)
+diff --git a/tests/kernels/gemm/test_exl3_dgemv.py b/tests/kernels/gemm/test_exl3_dgemv.py
+index ece0d667..1180ad5c 100644
+--- a/tests/kernels/gemm/test_exl3_dgemv.py
++++ b/tests/kernels/gemm/test_exl3_dgemv.py
+@@ -187,3 +187,55 @@ def test_graph_replay_matches_eager(device, m):
+             assert torch.equal(C, ref)
+     finally:
+         ext.exl3_dgemv_set_enabled(-1)
++
++
++@torch.inference_mode()
++def test_one_workspace_per_device(device):
++    """One workspace per device (EXL3_DGEMV_WS_MB, default 4 MiB of partials), shared by every stream: calls on a
++    second stream and inside a graph capture (its own capture stream) allocate nothing more and give the same bits;
++    a call whose partials exceed the workspace takes the vendor path"""
++    k, n, K, m = 2560, 640, 7, 8
++    p, suh, svh, g = _weights(k, n, K, 4242)
++    tr = torch.from_numpy(p.copy()).to(device)
++    sd, vd = suh.to(device), svh.to(device)
++    A = (torch.randn(m, k, generator = g) * 0.5).half().to(device)
++
++    def nontorch():
++        torch.cuda.synchronize(device)
++        free, total = torch.cuda.mem_get_info(device)
++        return total - free - torch.cuda.memory_reserved(device)
++
++    ref = _gemm(A, tr, sd, vd, n, False, 2)
++    base = nontorch()
++    C = torch.empty(m, n, dtype = torch.half, device = device)
++    Ah = torch.empty_like(A)
++    ext.exl3_dgemv_set_enabled(2)
++    try:
++        s = torch.cuda.Stream(device)
++        s.wait_stream(torch.cuda.current_stream(device))
++        with torch.cuda.stream(s):
++            ext.exl3_gemm(A, tr, C, sd, Ah, vd, -1, False, True, 0)
++            torch.cuda.synchronize(device)
++            assert torch.equal(C, ref)
++            gr = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(gr, stream = s):
++                ext.exl3_gemm(A, tr, C, sd, Ah, vd, -1, False, True, 0)
++        C.zero_()
++        gr.replay()
++        torch.cuda.synchronize(device)
++        assert torch.equal(C, ref)
++    finally:
++        ext.exl3_dgemv_set_enabled(-1)
++    # Not asserted: the non-torch delta (total - free - torch reserved) is torch's graph pool, reserved and freed across
++    # captures, not the DGEMV workspace. RM's 7b split: 0 MiB at the eager, second-stream, capture and control stages;
++    # +192 MiB only after the controls. The workspace is allocated at the first eager call, before `base`, and the bit
++    # checks above show the second stream and the capture use the same result.
++
++    # 48 rows x 2560 -> 12288: 3 k splits, 48 * 12288 * 3 fp32 partials = 6.75 MiB > the 4 MiB default
++    kq, nq = 2560, 12288
++    pq, sq, vq, gq = _weights(kq, nq, K, 77)
++    trq = torch.from_numpy(pq.copy()).to(device)
++    Aq = (torch.randn(48, kq, generator = gq) * 0.5).half().to(device)
++    sqd, vqd = sq.to(device), vq.to(device)
++    assert torch.equal(_gemm(Aq, trq, sqd, vqd, nq, False, 2), _gemm(Aq, trq, sqd, vqd, nq, False, 0)), \
++        "over-size call must take the vendor path"
+-- 
+2.43.0
+

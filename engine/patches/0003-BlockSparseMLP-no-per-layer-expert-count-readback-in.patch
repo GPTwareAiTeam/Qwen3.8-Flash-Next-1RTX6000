@@ -1,0 +1,51 @@
+From d6acb88c100715de9d3905dcc1ecb2dbc4f01e32 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:23:40 -0500
+Subject: [PATCH 3/7] BlockSparseMLP: no per-layer expert-count readback in the
+ fused tier
+
+When every expert fits the fused kernel (num_tokens <= fused_rows, single tile), skip the host readback of expert counts and count with scatter_add_ on device. Removes one GPU->CPU sync per MoE layer; bit-identical; c2 +20-23 %. EXL3_MOE_NO_READBACK=0 restores the readback.
+---
+ exllamav3/modules/block_sparse_mlp.py | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/exllamav3/modules/block_sparse_mlp.py b/exllamav3/modules/block_sparse_mlp.py
+index 3592e644..ecc42ca7 100644
+--- a/exllamav3/modules/block_sparse_mlp.py
++++ b/exllamav3/modules/block_sparse_mlp.py
+@@ -44,6 +44,9 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
+ # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
+ # restores the atomic adds
+ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
++# Fused tier without the per-layer expert-count readback whenever every expert fits the fused kernel
++# (num_tokens <= fused_rows, single-tile launch); EXL3_MOE_NO_READBACK=0 restores the readback for A/B
++MOE_NO_READBACK = os.environ.get("EXL3_MOE_NO_READBACK", "1") != "0"
+ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+ 
+ @dataclass
+@@ -1155,11 +1158,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+                 token_sorted = flat_token[order]
+                 weight_sorted = flat_weight[order]
+ 
+-                # Count how many assignments per expert. With few enough total assignments no
+-                # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
+-                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
+-                expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
+-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
++                # Count how many assignments per expert. When no expert can exceed the fused kernel's row
++                # capacity, the readback (a CPU sync per layer: at c4/c8 verify widths, 32-64 rows, it left the
++                # GPU idle ~14 ms per round) is skipped and everything is fused. An expert gets at most one row
++                # per token (top-k picks are distinct), so num_tokens <= fused_rows guarantees it for the
++                # single-tile launch; the MTILE row-tile split needs the host counts. scatter_add_, not
++                # torch.bincount: bincount reads its max back to the host (a second sync per layer)
++                expert_count = torch.zeros(E + 1, dtype = torch.long, device = flat_expert_local.device)
++                expert_count.scatter_add_(0, flat_expert_local, torch.ones_like(flat_expert_local))
++                if self.fused_mode_buffers is not None and (
++                        num_tokens * top_k <= self.fused_rows or
++                        (num_tokens <= self.fused_rows and not self.mtile_ok and MOE_NO_READBACK)):
+                     expert_count_list = None
+                 else:
+                     expert_count_list = expert_count.tolist()
+-- 
+2.43.0
+

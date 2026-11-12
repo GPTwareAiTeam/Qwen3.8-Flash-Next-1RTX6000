@@ -1,0 +1,281 @@
+From 7cff1c8088e78288da976273a0aad4f87896012a Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:23:40 -0500
+Subject: [PATCH 5/7] DFlash2: capture the drafter layer stack as a CUDA graph
+ (EXL3_DFLASH_GRAPH)
+
+Sliding-window metadata and the input embedding are staged on device outside the capture; ring shifts fall back to eager. Lossless; c8 +4 %, code +5 %.
+---
+ exllamav3/architecture/dflash2.py |  52 +++++++++
+ exllamav3/modules/sliding_attn.py |   3 +-
+ exllamav3/util/segment.py         | 174 ++++++++++++++++++++++++++++++
+ 3 files changed, 228 insertions(+), 1 deletion(-)
+ create mode 100644 exllamav3/util/segment.py
+
+diff --git a/exllamav3/architecture/dflash2.py b/exllamav3/architecture/dflash2.py
+index 9b78defb..b88cc6fb 100644
+--- a/exllamav3/architecture/dflash2.py
++++ b/exllamav3/architecture/dflash2.py
+@@ -2,6 +2,11 @@ from __future__ import annotations
+ from typing_extensions import override
+ import torch
+ import weakref
++import os
++from ..util.segment import Segment
++from ..cache.recurrent_util import advance_recurrent_states
++
++_DRAFT_GRAPH = os.environ.get("EXL3_DFLASH_GRAPH", "0") == "1"
+ 
+ from ..cache import Cache
+ from ..model.config import no_default
+@@ -330,6 +335,53 @@ class DFlash2Model(Model):
+         return {}
+ 
+ 
++    @torch.inference_mode()
++    def forward(self, input_ids: torch.Tensor, params: dict | None = None):
++        if not _DRAFT_GRAPH or params is None or params.get("tp_warmup") or self.loaded_tp:
++            return super().forward(input_ids, params)
++        bsz = input_ids.shape[0]
++        states = params.get("recurrent_states")
++        if (bsz not in (1, 2, 4, 8) or self.config.block_size != 8 or not states or
++                len(states) != bsz or not all(isinstance(a, SlidingAttention) for a in self.attn_modules)):
++            return super().forward(input_ids, params)
++        first = self.attn_modules[0]
++        if any(a.device != first.device or a.kv_state_size != first.kv_state_size for a in self.attn_modules):
++            return super().forward(input_ids, params)
++        if any(r.position - r.window_beg + 8 > first.kv_state_size for r in states):
++            return super().forward(input_ids, params)
++
++        x = self.prepare_inputs(input_ids, params)
++        # Input embedding uses CPU token IDs and remains outside the device graph.
++        module, instance, _ = self.fwd_modules[0]
++        if module is not self.input_layer:
++            return super().forward(input_ids, params)
++        params["layer_instance"] = instance
++        x = module.forward(module.prepare_for_device(x, params), params)
++        x = self.fwd_modules[1][0].prepare_for_device(x, params)
++        rsl = states[0].cache.get_recurrent_layer((first.layer_idx, instance))
++        k, v = rsl.get_state_tensors()
++        bt, lengths = first._decode_state_prep(states, k, v, 8)
++        positions = get_for_device(params, "positions", first.device, None)
++        if positions is None:
++            return super().forward(input_ids, params)
++        if not hasattr(self, "_draft_segments"):
++            self._draft_segments = {}
++        key = (bsz, id(states[0].cache), tuple(x.shape), x.device)
++        seg = self._draft_segments.get(key)
++        if seg is None:
++            def body(x, bt, lengths, positions, p):
++                p["dflash_graph_swa"] = (bt, lengths)
++                p["positions"] = positions
++                for mod, inst, _ in self.fwd_modules[1:]:
++                    p["layer_instance"] = inst
++                    x = mod.forward(mod.prepare_for_device(x, p), p)
++                return x,
++            seg = self._draft_segments[key] = Segment(body, label = f"dflash bsz={bsz}")
++        x, = seg(x, bt, lengths, positions, params)
++        params.pop("dflash_graph_swa", None)
++        advance_recurrent_states(input_ids, params, self)
++        return x
++
+     @override
+     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+         assert input_ids.shape[-1] == 1, \
+diff --git a/exllamav3/modules/sliding_attn.py b/exllamav3/modules/sliding_attn.py
+index b53f5173..3a5013cc 100644
+--- a/exllamav3/modules/sliding_attn.py
++++ b/exllamav3/modules/sliding_attn.py
+@@ -1107,7 +1107,8 @@ class SlidingAttention(Module):
+         if seqlen <= 16 and not non_causal_spans:
+             # Decode: append into the state (shifting it left first on the rare step where the
+             # window run reaches the end of the buffer) and attend over the pages
+-            bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
++            prepared = params.get("dflash_graph_swa")
++            bt, cache_seqlens = prepared if prepared is not None else self._decode_state_prep(rsg, k_states, v_states, seqlen)
+ 
+             o = paged_attn_triton_decode(
+                 q, k, v, k_pages, v_pages, bt, cache_seqlens,
+diff --git a/exllamav3/util/segment.py b/exllamav3/util/segment.py
+new file mode 100644
+index 00000000..665be350
+--- /dev/null
++++ b/exllamav3/util/segment.py
+@@ -0,0 +1,174 @@
++"""Piecewise CUDA graph segments for the decode step.
++
++A Segment wraps a position-free stretch of the decode forward. Tensor arguments are copied into static
++device buffers; the first call after one eager warmup records a CUDA graph over the wrapped function, and
++every later call copies the tensors in, replays, and returns the static outputs.
++
++Non-tensor arguments (the per-step params dict) are passed through live on every call and are NOT baked
++into the graph: the captured body may only read per-step state through static device buffers.
++
++All segments share one graph memory pool so intermediate allocations of different segments reuse blocks.
++"""
++import torch
++import os
++
++_CHECK = os.environ.get("EXL3_SEG_CHECK", "0") == "1"
++_MEMLOG = os.environ.get("EXL3_SEG_MEMLOG", "0") == "1"
++_REPORTED = False
++
++_POOL = None
++_STREAMS: dict = {}
++_TENSOR_SLOT = object()
++_PARAM_FLAGS = ("tp_warmup", "prefill", "autosplit_measure", "pad_bucket", "activate_all_experts",
++                "q_mlp_slice", "export_state_layers", "export_state_norm_keys")
++_PARAM_PRESENCE = ("backend", "quant_preserve", "capture", "capture_qmaps", "capture_sens",
++                   "external_selected", "external_weights", "residual")
++
++def _param_signature(params):
++    if params is None:
++        return None
++    return (tuple((k, repr(params.get(k))) for k in _PARAM_FLAGS),
++            tuple((k, k in params) for k in _PARAM_PRESENCE))
++
++
++def _pool():
++    global _POOL
++    if _POOL is None:
++        _POOL = torch.cuda.graph_pool_handle()
++    return _POOL
++
++
++def _capture_stream() -> torch.cuda.Stream:
++    """One capture stream per device for every Segment. A fresh torch.cuda.Stream() per capture rotates
++    through torch's pool of 32 streams, and the captured bodies key per-stream device workspaces on it
++    (exl3_dgemv.cu get_ws: 64 MiB per (device, stream), raw cudaMalloc, never freed): each new decode
++    shape then grew non-torch memory by ~66 MiB until all 32 pool streams had one, ~2.1 GiB at B >= 2
++    (graphbuckets memprobe 2026-11-05: +66 MiB per first capture, unrecovered by dropping every graph)."""
++    dev = torch.cuda.current_device()
++    s = _STREAMS.get(dev)
++    if s is None:
++        s = _STREAMS[dev] = torch.cuda.Stream()
++    return s
++
++
++class Segment:
++    """fn(*args) -> tensor or tuple of tensors.
++
++    carry: params keys whose tensor values flow between segments through the params dict (e.g. the mHC
++    "hc_pre" collapse weights each site hands to the next). A carried tensor present on entry is a static
++    input; the value the captured body leaves under that key is a static output written back into the live
++    params after every replay (Python side effects of the body do not run on replay)."""
++
++    def __init__(self, fn, carry = (), label = "unknown"):
++        self.fn = fn
++        self.carry = tuple(carry)
++        self.label = label
++        self.graph = None
++        self.static_in = None
++        self.static_out = None
++        self.carry_in = {}
++        self.carry_out = {}
++        self.replays = 0
++        self.warm = 0
++
++    @staticmethod
++    def _params(args):
++        return next((a for a in args if isinstance(a, dict)), None)
++
++    def __call__(self, *args):
++        if self.graph is None:
++            if self.warm < 2:
++                # Inner C++ graph sites run eagerly once and capture on their second call.
++                # Finish those captures before beginning the outer segment capture.
++                self.warm += 1
++                out = self.fn(*args)
++                return tuple(out) if isinstance(out, (tuple, list)) else (out,)
++            self._capture(args)
++        assert _param_signature(self._params(args)) == self.param_signature, "Segment capture parameter flags changed"
++        tens = [a for a in args if isinstance(a, torch.Tensor)]
++        # One batched copy per replay instead of one launch per input/carry tensor
++        params = self._params(args)
++        dsts = list(self.static_in)
++        srcs = tens
++        if self.carry_in:
++            dsts += list(self.carry_in.values())
++            srcs += [params[k] for k in self.carry_in]
++        torch._foreach_copy_(dsts, srcs, non_blocking = True)
++        if _CHECK:
++            # Preserve the original inputs: the graph body can update its static input in place.
++            check_args = tuple(a.clone() if isinstance(a, torch.Tensor) else
++                               {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in a.items()}
++                               if isinstance(a, dict) else a for a in args)
++        self.graph.replay()
++        if _MEMLOG:
++            self.replays += 1
++            if self.replays in (1, 10, 100):
++                print(f"SEG_REPLAY {self.label} count={self.replays}", flush=True)
++        if _CHECK:
++            global _REPORTED
++            # Preserve graph outputs before the eager call overwrites shared scratch buffers.
++            actual = tuple(t.clone() if isinstance(t, torch.Tensor) else t for t in self.static_out)
++            expected = self.fn(*check_args)
++            expected = tuple(expected) if isinstance(expected, (tuple, list)) else (expected,)
++            for i, (a, b) in enumerate(zip(actual, expected)):
++                if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
++                    if not torch.equal(a, b) and not _REPORTED:
++                        diff = (a.float() - b.float()).abs()
++                        print(f"SEG_CHECK divergence {self.label} output={i} shape={tuple(a.shape)} "
++                              f"max_abs={diff.nan_to_num(nan=float('inf')).max().item()}", flush=True)
++                        _REPORTED = True
++                elif type(a) is not type(b) and not _REPORTED:
++                    print(f"SEG_CHECK divergence {self.label} output={i} types={type(a)},{type(b)}", flush=True)
++                    _REPORTED = True
++            for dst, saved in zip(self.static_out, actual):
++                if isinstance(dst, torch.Tensor):
++                    dst.copy_(saved)
++        for k, t in self.carry_out.items():
++            params[k] = t
++        return self.static_out
++
++    def _capture(self, args):
++        self.static_in = tuple(a.clone() for a in args if isinstance(a, torch.Tensor))
++        params = self._params(args)
++        self.param_signature = _param_signature(params)
++        cap_params = dict(params) if params is not None else None
++        if cap_params is not None:
++            for k in self.carry:
++                v = cap_params.get(k)
++                if isinstance(v, torch.Tensor):
++                    self.carry_in[k] = cap_params[k] = v.clone()
++        # Non-tensor args are fixed for the capture (the params dict is replaced by the capture copy)
++        self.layout = [
++            cap_params if a is params and params is not None else (a if not isinstance(a, torch.Tensor) else _TENSOR_SLOT)
++            for a in args
++        ]
++        s = _capture_stream()
++        s.wait_stream(torch.cuda.current_stream())
++        g = torch.cuda.CUDAGraph()
++        with torch.cuda.stream(s):
++            # capture_begin/end directly: the torch.cuda.graph context manager device-syncs and
++            # flushes the allocator on enter, once per segment, inside the decode window
++            g.capture_begin(pool = _pool(), capture_error_mode = "thread_local")
++            try:
++                out = self.fn(*self._interleave(self.static_in))
++            finally:
++                g.capture_end()
++        torch.cuda.current_stream().wait_stream(s)
++        if _MEMLOG:
++            device = torch.cuda.current_device()
++            free, total = torch.cuda.mem_get_info(device)
++            print(f"SEG_MEM {self.label} allocated={torch.cuda.memory_allocated(device)} "
++                  f"reserved={torch.cuda.memory_reserved(device)} used={total - free}", flush=True)
++        self.graph = g
++        self.static_out = tuple(out) if isinstance(out, (tuple, list)) else (out,)
++        if cap_params is not None:
++            for k in self.carry:
++                v = cap_params.get(k)
++                if isinstance(v, torch.Tensor) and v is not self.carry_in.get(k):
++                    self.carry_out[k] = v
++        # Layout is used only during capture; retaining cap_params pins arbitrary temporary tensors.
++        self.layout = None
++
++    def _interleave(self, tens):
++        it = iter(tens)
++        return [next(it) if slot is _TENSOR_SLOT else slot for slot in self.layout]
+-- 
+2.43.0
+

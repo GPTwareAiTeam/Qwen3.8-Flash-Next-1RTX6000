@@ -1,0 +1,1000 @@
+From 79e13264124f9b5df189a37ef829eeb9eec861e3 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:23:39 -0500
+Subject: [PATCH 2/7] DGEMV: dense decode GEMV with K6/K7 instances
+ (EXL3_DGEMV, default off)
+
+Split-K ordinary-launch GEMV for 1..48 rows, ported from the QMesh R5 fork with K 6/7 instances. Off by default: not bit-identical to the vendor path and net neutral on Qwen3.8-Flash-Next.
+---
+ exllamav3/exllamav3_ext/bindings.cpp          |   7 +
+ .../quant/comp_units/exl3_dgemv_inst_k6.cu    |  10 +
+ .../quant/comp_units/exl3_dgemv_inst_k7.cu    |  10 +
+ .../quant/comp_units/exl3_dgemv_instances.cuh |  26 ++
+ exllamav3/exllamav3_ext/quant/exl3_dgemv.cu   | 220 ++++++++++++
+ exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh  |  39 +++
+ .../exllamav3_ext/quant/exl3_dgemv_kernel.cuh | 316 ++++++++++++++++++
+ exllamav3/exllamav3_ext/quant/exl3_gemm.cu    |  62 +++-
+ tests/kernels/gemm/test_exl3_dgemv.py         | 189 +++++++++++
+ 9 files changed, 869 insertions(+), 10 deletions(-)
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k6.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k7.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_instances.cuh
+ create mode 100644 exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
+ create mode 100644 exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh
+ create mode 100644 exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh
+ create mode 100644 tests/kernels/gemm/test_exl3_dgemv.py
+
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index f376686f..4605b0cb 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -26,6 +26,9 @@
+ #include "quant/exl3_gemm.cuh"
+ #include "quant/exl3_gemv.cuh"
+ #include "quant/exl3_gemv_int8.cuh"
++#if !defined(USE_ROCM)
++#include "quant/exl3_dgemv.cuh"
++#endif
+ #include "quant/frac.cuh"
+ #include "cpu/moe_mul1.h"
+ #include "cpu/moe_handoff.h"
+@@ -223,6 +226,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
+     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
+     m.def("fa75_fwd", &fa75_fwd, "fa75_fwd");
++    m.def("exl3_dgemv_enabled", &exl3_dgemv_enabled, "exl3_dgemv_enabled");
++    m.def("exl3_dgemv_has", &exl3_dgemv_has, "exl3_dgemv_has");
++    m.def("exl3_dgemv_set_enabled", &exl3_dgemv_set_enabled, "exl3_dgemv_set_enabled");
++    m.def("exl3_dgemv_splits_for", &exl3_dgemv_splits_for, "exl3_dgemv_splits_for");
+ #endif
+     m.def("rope", &rope, "rope");
+     m.def("gen_mrope_pos_ids", &gen_mrope_pos_ids, "gen_mrope_pos_ids");
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k6.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k6.cu
+new file mode 100644
+index 00000000..1b04d424
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k6.cu
+@@ -0,0 +1,10 @@
++// CUDA only (the ROCm build has its own RDNA GEMVs)
++#if !defined(USE_ROCM)
++#include <cuda_fp16.h>
++#include "../../util.h"
++#include "../../util.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++#include "exl3_dgemv_instances.cuh"
++
++EXL3_DGEMV_SEL_DEF(6)
++#endif
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k7.cu b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k7.cu
+new file mode 100644
+index 00000000..162e21a9
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_inst_k7.cu
+@@ -0,0 +1,10 @@
++// CUDA only (the ROCm build has its own RDNA GEMVs)
++#if !defined(USE_ROCM)
++#include <cuda_fp16.h>
++#include "../../util.h"
++#include "../../util.cuh"
++#include "../exl3_dgemv_kernel.cuh"
++#include "exl3_dgemv_instances.cuh"
++
++EXL3_DGEMV_SEL_DEF(7)
++#endif
+diff --git a/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_instances.cuh b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_instances.cuh
+new file mode 100644
+index 00000000..b6c864ef
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/comp_units/exl3_dgemv_instances.cuh
+@@ -0,0 +1,26 @@
++#pragma once
++
++// Dense decode GEMV instances (exl3_dgemv_kernel.cuh), one translation unit per bitrate, mul1
++// codebook only (every dense tensor the runtime ships is mul1). Bitrates 6 and 7: Qwen3.8-Flash-Next's dense
++// projections (K 7) and head (K 6). MT = row tiles of 16 (1..3 = up to
++// 48 rows); multi selects the multi-matrix (mgemm-signature) kernel. nullptr = no instance.
++
++void* exl3_dgemv_sel_k6(int MT, bool c_fp32, bool multi);
++void* exl3_dgemv_sel_k7(int MT, bool c_fp32, bool multi);
++
++#define EXL3_DGEMV_SEL_MT_(K_, MT_) \
++    case MT_: \
++        if (multi) return c_fp32 ? (void*) exl3_dmgemv_kernel<K_, 2, MT_, true> : (void*) exl3_dmgemv_kernel<K_, 2, MT_, false>; \
++        return c_fp32 ? (void*) exl3_dgemv_kernel<K_, 2, MT_, true> : (void*) exl3_dgemv_kernel<K_, 2, MT_, false>;
++
++#define EXL3_DGEMV_SEL_DEF(K_) \
++    void* exl3_dgemv_sel_k##K_(int MT, bool c_fp32, bool multi) \
++    { \
++        switch (MT) \
++        { \
++            EXL3_DGEMV_SEL_MT_(K_, 1) \
++            EXL3_DGEMV_SEL_MT_(K_, 2) \
++            EXL3_DGEMV_SEL_MT_(K_, 3) \
++        } \
++        return nullptr; \
++    }
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
+new file mode 100644
+index 00000000..5c1df391
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
+@@ -0,0 +1,220 @@
++// CUDA only (the ROCm build has its own RDNA GEMVs)
++#if !defined(USE_ROCM)
++#include <cuda_fp16.h>
++#include "exl3_dgemv.cuh"
++
++#include <c10/cuda/CUDAGuard.h>
++#include <ATen/cuda/CUDAContext.h>
++#include "../util.h"
++#include "../util.cuh"
++#include "exl3_dgemv_kernel.cuh"
++#include "exl3_devctx.cuh"
++#include "comp_units/exl3_dgemv_instances.cuh"
++#include <cstdlib>
++#include <map>
++#include <mutex>
++#include <set>
++#include <utility>
++
++/*
++Dense decode GEMV dispatch (kernel: exl3_dgemv_kernel.cuh).
++
++Ported from the QMesh R5 exllamav3 fork (github.com/GPTwareAiTeam/QMesh-1xRTXPro6000-1xGB10) with K 6 / 7 instances, the dense rates Qwen3.8-Flash-Next
++ships. EXL3_DGEMV=1 routes eligible exl3_gemm / exl3_mgemm calls here ahead of every other path; 0 (default in this
++tree until the Qwen A/B and quality gate pass: not bit-identical to the vendor paths) leaves the vendor dispatch
++untouched. Eligible: mul1 codebook, integer K in {6, 7}, 1..48 rows,
++k and n multiples of 128, input/output scales present; for exl3_mgemm additionally unweighted,
++unfiltered, single-token and unsliced (the dense fans: x-side projection fan, q_b + indexer q_b fan,
++wo_a's grouped slices, shared w1+w3).
++
++Grid: one block per (128-column block, k split[, matrix]). The split count is a pure function of the
++matrix's (rows, k, n) (exl3_dgemv_ns::splits_for): ~EXL3_DGEMV_TARGET_BLOCKS blocks per matrix, so a
++matrix produces the same bits alone or inside a fan, and the partials are summed in split order (no
++float atomics): deterministic for a given shape.
++
++Workspace: fixed per (device, stream), allocated on first use and never reallocated (the pointer is
++baked into captured graphs). Counters at its head self-reset; partials follow, one fixed slab per
++multi-matrix slot.
++*/
++
++#define DGEMV_WS_BYTES (EXL3_DGEMV_CNT_INTS * 4 + EXL3_DGEMV_MAX_SLOTS * EXL3_DGEMV_SLOT_FLOATS * 4)
++
++// 0 off, 1 measured envelope (default), 2 every hard-eligible call (testing). exl3_dgemv_set_enabled
++// overrides the env (-1 restores it)
++static int dgemv_mode_override = -1;
++
++static int dgemv_mode()
++{
++    if (dgemv_mode_override >= 0) return dgemv_mode_override;
++    static const int env = [] { const char* e = std::getenv("EXL3_DGEMV"); return e ? atoi(e) : 0; }();
++    return env;
++}
++
++bool exl3_dgemv_enabled() { return dgemv_mode() != 0; }
++
++void exl3_dgemv_set_enabled(int mode) { dgemv_mode_override = mode; }
++
++static void* select_kernel(int K, int MT, bool c_fp32, bool multi)
++{
++    switch (K)
++    {
++        case 6: return exl3_dgemv_sel_k6(MT, c_fp32, multi);
++        case 7: return exl3_dgemv_sel_k7(MT, c_fp32, multi);
++    }
++    return nullptr;
++}
++
++static int smem_bytes(int K, int MT)
++{
++    return 2 * EXL3_DGEMV_WARPS * 64 * K * 4 + 2 * 16 * MT * EXL3_DGEMV_A_STRIDE * 2 + 16;
++}
++
++bool exl3_dgemv_has(int K, int cb, int size_m, bool c_fp32)
++{
++    if (cb != 2 || size_m < 1 || size_m > EXL3_DGEMV_MAX_M) return false;
++    int MT = CEIL_DIVIDE(size_m, 16);
++    return select_kernel(K, MT, c_fp32, false) && select_kernel(K, MT, c_fp32, true);
++}
++
++// One workspace per (device, stream): two streams may run dense GEMMs concurrently (the P7 compute stream
++// and the head stream), and the self-resetting counters and partials must not be shared between them.
++// The pointer is baked into captured graphs, so a buffer lives for the process. First use may be inside
++// a capture (graphs capture on their own stream): the allocation then runs in relaxed capture mode and
++// the counters are zeroed on a private non-blocking stream, neither of which is captured
++static int* get_ws(int device, cudaStream_t stream)
++{
++    static std::mutex mtx;
++    static std::map<std::pair<int, cudaStream_t>, int*> ws;
++    std::lock_guard<std::mutex> lock(mtx);
++    auto key = std::make_pair(device, stream);
++    auto it = ws.find(key);
++    if (it != ws.end()) return it->second;
++
++    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
++    cuda_check(cudaThreadExchangeStreamCaptureMode(&mode));
++    int* p;
++    cuda_check(cudaMalloc(&p, DGEMV_WS_BYTES));
++    cudaStream_t init;
++    cuda_check(cudaStreamCreateWithFlags(&init, cudaStreamNonBlocking));
++    cuda_check(cudaMemsetAsync(p, 0, EXL3_DGEMV_CNT_INTS * sizeof(int), init));
++    cuda_check(cudaStreamSynchronize(init));
++    cuda_check(cudaStreamDestroy(init));
++    cuda_check(cudaThreadExchangeStreamCaptureMode(&mode));
++    ws[key] = p;
++    return p;
++}
++
++int exl3_dgemv_splits_for(int size_m, int size_k, int size_n)
++{
++    return exl3_dgemv_ns::splits_for(size_m, size_k, size_n);
++}
++
++static bool launch
++(
++    void* kernel, int K, int MT, int grid_x, int grid_z, void** kernel_args, int device, cudaStream_t stream
++)
++{
++    int smem = smem_bytes(K, MT);
++    static std::mutex mtx;
++    static std::set<std::pair<int, void*>> attr_set;
++    {
++        std::lock_guard<std::mutex> lock(mtx);
++        auto key = std::make_pair(device, kernel);
++        if (!attr_set.count(key))
++        {
++            if (smem > 48 * 1024)
++                cuda_check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
++            attr_set.insert(key);
++        }
++    }
++    cuda_check(cudaLaunchKernel(kernel, dim3(grid_x, 1, grid_z), dim3(EXL3_DGEMV_THREADS), kernel_args, smem, stream));
++    return true;
++}
++
++// Hard constraints, then the envelope where the kernel measured faster than the vendor path on an RTX PRO 6000
++// (QMesh R5 measurements, DSV4.1 shapes, graph-replay medians, real tensors, K 4/5/6/8; unmeasured on Qwen K7):
++//  - the head (k * n = 662M) never: DRAM-bound, the vendor kernel is at the bandwidth floor
++//    (8 bpw 441 vs 502 us at 4 rows) and this kernel's grid has no k split left at that width
++//  - 1 row: k * n <= 8M (wq_a, wkv, wo_a, compressor, indexer 1.1-1.8x; shared w1/w2 tie; wo_b, wq_b lose)
++//  - 2..16 rows (one MMA row tile): every shape up to k * n = 48M wins (wq_b 32768-wide 1.0-1.1x,
++//    wo_b 1.2-1.3x, the rest 1.5-3.1x)
++//  - 17..32 rows: k * n <= 12M (wq_a, wkv, wo_a, compressor, indexer, shared w1/w3/w2 1.2-1.7x;
++//    wo_b 8192 x 5120 and wq_b tie or lose)
++//  - 33..48 rows: k * n <= 6.6M (wkv/compressor 1.3x, indexer 1.1x, wo_a 1.04x, wq_a 1.04-1.3x;
++//    anything wider loses)
++// EXL3_DGEMV=2 drops the envelope (hard constraints only) for testing
++static bool eligible(int size_m, int size_k, int size_n, int K, bool half_k, int cb)
++{
++    if (half_k || cb != 2) return false;
++    if (size_m < 1 || size_m > EXL3_DGEMV_MAX_M) return false;
++    if (size_k <= 0 || size_k % 128 || size_n <= 0 || size_n % 128) return false;
++    if (!(K == 6 || K == 7)) return false;
++    if (dgemv_mode() == 2) return true;
++    int64_t kn = (int64_t) size_k * size_n;
++    if (size_m == 1) return kn <= 8 * 1024 * 1024;
++    if (size_m <= 16) return kn <= 48 * 1024 * 1024;
++    if (size_m <= 32) return kn <= 12 * 1024 * 1024;
++    return kn <= 6600 * 1024;
++}
++
++void* exl3_dgemv_try_launch
++(
++    void** kernel_args,
++    int size_m, int size_k, int size_n,
++    int K, bool half_k, int cb, bool c_fp32, bool has_su_sv,
++    int device, cudaStream_t stream
++)
++{
++    if (!has_su_sv || !eligible(size_m, size_k, size_n, K, half_k, cb)) return nullptr;
++    int MT = CEIL_DIVIDE(size_m, 16);
++    void* kernel = select_kernel(K, MT, c_fp32, false);
++    TORCH_CHECK(kernel, "exl3_dgemv: no instance for K=", K, " rows=", size_m);
++    int splits = exl3_dgemv_ns::splits_for(size_m, size_k, size_n);
++    TORCH_CHECK(size_n / 128 <= EXL3_DGEMV_CNT_INTS, "exl3_dgemv: too many column blocks");
++
++    int* ws = get_ws(device, stream);
++    void* args[10];
++    for (int i = 0; i < 10; ++i) args[i] = kernel_args[i];
++    args[6] = (void*) &ws;
++    launch(kernel, K, MT, size_n / 128 * splits, 1, args, device, stream);
++    return kernel;
++}
++
++void* exl3_dmgemv_try_launch
++(
++    void** kernel_args,
++    int size_m, int size_k, int size_n,
++    int K, bool half_k, int cb, bool c_fp32,
++    int bszm_in, int bszm_out, bool weighted, int min_index, int num_tokens, bool sliced,
++    int device, cudaStream_t stream
++)
++{
++    if (weighted || min_index >= 0 || num_tokens != 1 || sliced) return nullptr;
++    int slots = MAX(bszm_in, bszm_out);
++    int ncb = size_n / 128;
++    if (slots < 1 || slots > EXL3_DGEMV_MAX_SLOTS || ncb > EXL3_DGEMV_CNT_INTS / EXL3_DGEMV_MAX_SLOTS) return nullptr;
++    if (!eligible(size_m, size_k, size_n, K, half_k, cb)) return nullptr;
++    // Fan envelope (measured, graph replay): the launch's blocks share the device, so above one MMA row
++    // tile it is the launch's weight bound (slots x k x widest n) that decides. 17..32 rows: <= 14M
++    // (q_a + wkv, 2 x 5120 x 1280 = 13.1M, wins 1.7x; shared w1+w3 23.6M and wo_a x8 33.6M lose);
++    // 33..48 rows: never (every measured fan ties or loses)
++    if (dgemv_mode() != 2 && size_m > 16)
++    {
++        int64_t total = (int64_t) slots * size_k * size_n;
++        if (size_m > 32 || total > 14 * 1024 * 1024) return nullptr;
++    }
++    int MT = CEIL_DIVIDE(size_m, 16);
++    void* kernel = select_kernel(K, MT, c_fp32, true);
++    TORCH_CHECK(kernel, "exl3_dmgemv: no instance for K=", K, " rows=", size_m);
++    // Per-slot widths live on the device; ncb * splits_for(n) <= min(TARGET + ncb - 1, ncb * kgroups) for
++    // every n <= size_n, so this grid covers every slot (blocks past a slot's own count exit at once)
++    int grid_x = MIN(EXL3_DGEMV_TARGET_BLOCKS - 1 + ncb, ncb * (size_k / 128));
++
++    int* ws = get_ws(device, stream);
++    void* args[22];
++    for (int i = 0; i < 22; ++i) args[i] = kernel_args[i];
++    args[6] = (void*) &ws;
++    launch(kernel, K, MT, grid_x, slots, args, device, stream);
++    return kernel;
++}
++#endif
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh
+new file mode 100644
+index 00000000..5810c6eb
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cuh
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <cstdint>
++#include <cuda_runtime.h>
++
++// Dense decode GEMV (exl3_dgemv_kernel.cuh): ordinary-launch split-K GEMV for EXL3 trellis weights at
++// 1..48 rows, mul1 codebook, K 6/7. EXL3_DGEMV=1 = R5's measured envelope, 2 = every hard-eligible call,
++// 0 = off (default). The try_launch functions take the caller's EXL3_GEMM_ARGS / EXL3_MGEMM_ARGS
++// arrays (same parameter positions, so graph recording in exl3_gemm_gr / exl3_mgemm_gr is
++// unchanged), replace the `locks` slot with the GEMV workspace, and return the launched kernel or
++// nullptr (nothing launched: the caller's own path runs).
++
++bool exl3_dgemv_enabled();
++
++// True when kernel instances exist for (K, cb, c_fp32) at size_m rows. Tests use this to hard-fail
++// on a missing instantiation instead of silently measuring the fallback
++bool exl3_dgemv_has(int K, int cb, int size_m, bool c_fp32);
++
++// Mode 0 off / 1 measured envelope / 2 every hard-eligible call; -1 = from EXL3_DGEMV (default 0)
++void exl3_dgemv_set_enabled(int enabled);
++// k splits a matrix of this shape runs with
++int exl3_dgemv_splits_for(int size_m, int size_k, int size_n);
++
++void* exl3_dgemv_try_launch
++(
++    void** kernel_args,         // EXL3_GEMM_ARGS order; [6] (locks) is replaced
++    int size_m, int size_k, int size_n,
++    int K, bool half_k, int cb, bool c_fp32, bool has_su_sv,
++    int device, cudaStream_t stream
++);
++
++void* exl3_dmgemv_try_launch
++(
++    void** kernel_args,         // EXL3_MGEMM_ARGS order; [6] (locks) is replaced
++    int size_m, int size_k, int size_n,
++    int K, bool half_k, int cb, bool c_fp32,
++    int bszm_in, int bszm_out, bool weighted, int min_index, int num_tokens, bool sliced,
++    int device, cudaStream_t stream
++);
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh
+new file mode 100644
+index 00000000..b23e4bc8
+--- /dev/null
++++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv_kernel.cuh
+@@ -0,0 +1,316 @@
++#pragma once
++
++// Dense decode GEMV for EXL3 trellis weights, 1..48 rows, any integer bitrate dq_dispatch decodes.
++//
++// Decode-width dense projections are latency-bound, not bandwidth-bound: a 5120x512 6 bpw matrix is
++// 2 MB (~1.1 us at DRAM rate) but costs ~20 us in the cooperative block-pipelined exl3_gemm, whose
++// time goes to the cooperative launch, two grid-wide barriers (input Hadamard, output Hadamard) and a
++// long per-warp serial k loop. This kernel removes all three:
++//
++// - ordinary launch, no grid barrier. Split-K across blocks: block (column block, k split) covers 128
++//   output columns (one output Hadamard group, one n-tile per warp) and a contiguous run of 128-wide
++//   k groups (one input Hadamard group each), so every block computes exactly the slice of the input
++//   transform it consumes: the transform is done once per (block, group), nothing global
++// - every warp streams its weights with cp.async (L2 evict-first) into a warp-private two-stage ring
++//   and decodes them from shared memory with the standard dq_dispatch, so any K works and all of a
++//   group's loads are in flight at once
++// - fp32 MMA accumulation (m16n8k16, up to 3 row tiles = 48 rows sharing each decoded tile)
++// - per-split fp32 partials in a fixed workspace; the last-arriving split of a column block (counter,
++//   self-resetting) sums the partials in split order and runs the output Hadamard/svh epilogue with
++//   the same arithmetic as exl3_gemm's. Deterministic: fixed reduction order, no float atomics
++//
++// The single-matrix kernel takes EXL3_GEMM_ARGS (A_had unused, `locks` carries the workspace) and the
++// multi-matrix one EXL3_MGEMM_ARGS (slot j on gridDim.z), so exl3_gemm_gr / exl3_mgemm_gr record and
++// patch their graph parameters unchanged.
++
++#include <cuda_fp16.h>
++#include "../ptx.cuh"
++#include "../util.cuh"
++#include "exl3_dq.cuh"
++#include "exl3_kernel_map.cuh"
++#include "hadamard_inner.cuh"
++
++#define EXL3_DGEMV_MAX_M 48
++#define EXL3_DGEMV_WARPS 8
++#define EXL3_DGEMV_THREADS (EXL3_DGEMV_WARPS * 32)
++#define EXL3_DGEMV_CNT_INTS 16384       // completion counters at the head of the workspace
++#ifndef EXL3_DGEMV_TARGET_BLOCKS
++#define EXL3_DGEMV_TARGET_BLOCKS 256    // blocks per matrix the split rule aims for (RTX PRO 6000: 188 SMs)
++#endif
++#define EXL3_DGEMV_MAX_SLOTS 8          // matrices per multi-matrix launch
++#define EXL3_DGEMV_SLOT_FLOATS (2 * 1024 * 1024)   // partials per matrix (8 MB): 48 rows x 5120 x 8 splits
++#define EXL3_DGEMV_A_STRIDE 136         // halves per staged input row: 128 + 8 keeps fragment reads conflict-free
++
++namespace exl3_dgemv_ns {
++
++template <int bits> constexpr int tile_words() { return bits * 8; }              // uint32 per 16x16 tile
++template <int bits> constexpr int group_words() { return 8 * tile_words<bits>(); }  // one warp, one k group
++
++// k splits of one matrix: a pure function of its shape and row count, so a matrix computes the same
++// bits alone or inside a multi-matrix launch (and the summation order is fixed). About
++// EXL3_DGEMV_TARGET_BLOCKS blocks per matrix, never more splits than 128-wide k groups, partials of
++// at most EXL3_DGEMV_SLOT_FLOATS, every split owning >= 1 group
++__host__ __device__ __forceinline__ int splits_for(int size_m, int size_k, int size_n)
++{
++    const int kgroups = size_k / 128;
++    const int ncb = size_n / 128;
++    int s = (EXL3_DGEMV_TARGET_BLOCKS + ncb - 1) / ncb;
++    const int cap = EXL3_DGEMV_SLOT_FLOATS / (size_m * size_n);
++    s = s > cap ? cap : s;
++    s = s > kgroups ? kgroups : s;
++    s = s < 1 ? 1 : s;
++    const int kw = (kgroups + s - 1) / s;
++    return (kgroups + kw - 1) / kw;
++}
++
++extern __shared__ int4 dgemv_smem[];
++
++template <int bits, int cb, int MT, bool c_fp32>
++__device__ __forceinline__ void body
++(
++    const half* __restrict__ A,
++    const uint32_t* __restrict__ B32,
++    void* __restrict__ C,
++    const half* __restrict__ suh,
++    const half* __restrict__ svh,
++    float* __restrict__ ws,             // this matrix's partials, [splits][size_m][size_n]
++    int* __restrict__ cnt,              // this matrix's counters, one per column block
++    const int size_m,
++    const int size_k,
++    const int size_n,
++    const int splits,
++    const int cbi,
++    const int split
++)
++{
++    constexpr int TW = tile_words<bits>();
++    constexpr int GW = group_words<bits>();
++    constexpr int ROWS = 16 * MT;
++    constexpr int WARPS = EXL3_DGEMV_WARPS;
++    constexpr int AS = EXL3_DGEMV_A_STRIDE;
++    constexpr float R_SCALE = 0.088388347648f;  // 1/sqrt(128)
++
++    uint32_t* sh_w = (uint32_t*) dgemv_smem;                 // [2][WARPS][GW]
++    half* sh_a = (half*) (sh_w + 2 * WARPS * GW);            // [2][ROWS][AS]
++    int* sh_flag = (int*) (sh_a + 2 * ROWS * AS);
++
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++    const int kgroups = size_k / 128;
++    const int kw = CEIL_DIVIDE(kgroups, splits);
++    const int g0 = split * kw;
++    const int ng = MIN(kw, kgroups - g0);                   // <= 0 only for a degenerate split: zero partial
++    const int ntiles = size_n / 16;
++    const int tile = cbi * WARPS + warp;
++
++    // Weights of k group gi (8 k slices of this warp's n-tile) -> ring slot gi & 1. Always commits, so
++    // the wait count below is uniform
++    auto issue_w = [&] (int gi)
++    {
++        if (gi < ng)
++        {
++            uint32_t* dst = sh_w + ((gi & 1) * WARPS + warp) * GW;
++            const uint32_t* src = B32 + ((size_t) (g0 + gi) * 8 * ntiles + tile) * TW;
++            constexpr int V = GW / 4;          // 16-byte chunks
++            constexpr int TV = TW / 4;
++            #pragma unroll
++            for (int i = lane; i < V; i += 32)
++            {
++                const int s = i / TV;
++                const int j = i - s * TV;
++                cp_async_stream(dst + s * TW + j * 4, src + (size_t) s * ntiles * TW + j * 4);
++            }
++        }
++        cp_async_fence();
++    };
++
++    // Input scales + Hadamard of k group gi for every live row -> input ring slot gi & 1. MMA rows past
++    // size_m read whatever the slot holds: an output row depends only on its own input row, and those
++    // rows are never stored
++    auto had_a = [&] (int gi)
++    {
++        half* dst = sh_a + (gi & 1) * ROWS * AS;
++        const int kofs = (g0 + gi) * 128;
++        for (int r = warp; r < size_m; r += WARPS)
++            had_hf_r_128_inner<true, false>(A + (size_t) r * size_k + kofs, dst + r * AS, suh + kofs, R_SCALE);
++    };
++
++    FragC acc[MT][2];
++    #pragma unroll
++    for (int m = 0; m < MT; ++m) { acc[m][0] = {}; acc[m][1] = {}; }
++
++    if (ng > 0)
++    {
++        issue_w(0);
++        issue_w(1);
++        had_a(0);
++        __syncthreads();
++
++        const int r0 = lane >> 2;
++        const int q2 = 2 * (lane & 3);
++
++        for (int gi = 0; gi < ng; ++gi)
++        {
++            if (gi + 1 < ng) had_a(gi + 1);
++            cp_async_wait<1>();
++            __syncwarp();
++
++            const uint32_t* wb = sh_w + ((gi & 1) * WARPS + warp) * GW;
++            const half* ab = sh_a + (gi & 1) * ROWS * AS;
++
++            #pragma unroll
++            for (int s = 0; s < 8; ++s)
++            {
++                FragB f0, f1;
++                dq_dispatch<bits, cb>(wb + s * TW, lane << 3, f0, f1);
++                #pragma unroll
++                for (int m = 0; m < MT; ++m)
++                {
++                    const half* ar = ab + (m * 16 + r0) * AS + s * 16 + q2;
++                    FragA fa;
++                    fa[0] = *(const half2*) (ar);
++                    fa[1] = *(const half2*) (ar + 8 * AS);
++                    fa[2] = *(const half2*) (ar + 8);
++                    fa[3] = *(const half2*) (ar + 8 * AS + 8);
++                    ptx_mma_m16n8k16(fa, f0, acc[m][0]);
++                    ptx_mma_m16n8k16(fa, f1, acc[m][1]);
++                }
++            }
++
++            __syncthreads();      // ring slots gi & 1 free, input of gi + 1 visible
++            issue_w(gi + 2);
++        }
++        cp_async_wait<0>();
++    }
++    __syncthreads();      // rings free: the single-split staging below overlays them
++
++    // Partial of this block. Lane holds rows r0 (c0, c1) and r0 + 8 (c2, c3), cols f * 8 + q2 (+1).
++    // Split-K: to this split's workspace slab (row stride size_n). One split: straight to shared
++    // memory (row stride 128), the block finishes its column block alone
++    float* sh_c = (float*) dgemv_smem;
++    {
++        float* dst = splits > 1 ? ws + (size_t) split * size_m * size_n + tile * 16 : sh_c + warp * 16;
++        const int stride = splits > 1 ? size_n : 128;
++        const int r0 = lane >> 2;
++        const int q2 = 2 * (lane & 3);
++        #pragma unroll
++        for (int m = 0; m < MT; ++m)
++            #pragma unroll
++            for (int f = 0; f < 2; ++f)
++            {
++                const int col = f * 8 + q2;
++                const int ra = m * 16 + r0;
++                const int rb = ra + 8;
++                if (ra < size_m) *((float2*) (dst + (size_t) ra * stride + col)) = make_float2(acc[m][f][0], acc[m][f][1]);
++                if (rb < size_m) *((float2*) (dst + (size_t) rb * stride + col)) = make_float2(acc[m][f][2], acc[m][f][3]);
++            }
++    }
++
++    // Last arriving split of this column block finishes it
++    if (splits > 1) __threadfence();
++    __syncthreads();
++    if (splits > 1)
++    {
++        if (threadIdx.x == 0)
++        {
++            int old = atomicAdd(cnt + cbi, 1);
++            int last = old == splits - 1;
++            if (last) cnt[cbi] = 0;
++            *sh_flag = last;
++        }
++        __syncthreads();
++        if (!*sh_flag) return;
++        __threadfence();
++    }
++
++    const int c0 = cbi * 128;
++    for (int r = warp; r < size_m; r += WARPS)
++    {
++        float4 v;
++        if (splits == 1)
++            v = ((const float4*) (sh_c + r * 128))[lane];
++        else
++        {
++            v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            for (int s = 0; s < splits; ++s)
++            {
++                float4 p = __ldcg(((const float4*) (ws + ((size_t) s * size_m + r) * size_n + c0)) + lane);
++                v.x += p.x; v.y += p.y; v.z += p.z; v.w += p.w;
++            }
++        }
++
++        // Same epilogue as exl3_gemm: C holds the raw sum (rounded to the output type), then the output
++        // Hadamard with post scale runs over it in place. Each lane reads back only what it wrote
++        if constexpr (c_fp32)
++        {
++            float* cp = ((float*) C) + (size_t) r * size_n + c0;
++            ((float4*) cp)[lane] = v;
++            had_ff_r_128_inner<false, true>(cp, cp, svh + c0, R_SCALE);
++        }
++        else
++        {
++            half* cp = ((half*) C) + (size_t) r * size_n + c0;
++            ((half4*) cp)[lane] = half4(__float2half_rn(v.x), __float2half_rn(v.y),
++                                        __float2half_rn(v.z), __float2half_rn(v.w));
++            had_hf_r_128_inner<false, true>(cp, cp, svh + c0, R_SCALE);
++        }
++    }
++}
++
++}  // namespace exl3_dgemv_ns
++
++// One matrix. Grid: (size_n / 128) * splits_for(size_m, size_k, size_n) blocks, column block fastest;
++// `locks` is the workspace (EXL3_DGEMV_CNT_INTS counters, then the partials)
++template <int bits, int cb, int MT, bool c_fp32>
++__global__ __launch_bounds__(EXL3_DGEMV_THREADS)
++void exl3_dgemv_kernel(EXL3_GEMM_ARGS)
++{
++    const int ncb = size_n / 128;
++    const int splits = exl3_dgemv_ns::splits_for(size_m, size_k, size_n);
++    const int cbi = blockIdx.x % ncb;
++    const int split = blockIdx.x / ncb;
++    if (split >= splits) return;
++    exl3_dgemv_ns::body<bits, cb, MT, c_fp32>
++    (
++        A, (const uint32_t*) B, C, suh, svh,
++        (float*) (locks + EXL3_DGEMV_CNT_INTS), locks,
++        size_m, size_k, size_n, splits, cbi, split
++    );
++}
++
++// Several matrices, slot j = blockIdx.z (blockIdx.y stays 0: the Hadamard helpers index scales by it).
++// Slot j uses matrix B_indices[j] (or j), input A[j] (or the broadcast A), output C_list[mat] at width
++// size_n_list[mat] (or C[j] at size_n), and splits_for(size_m, size_k, its width) k splits, exactly as
++// a single-matrix launch would. Grid x: the largest ncb * splits over the slots (host computed); blocks
++// past a slot's own count exit. Slot j owns counters [j * CNT_INTS / MAX_SLOTS, +CNT_INTS / MAX_SLOTS)
++// and partials [j * SLOT_FLOATS, +SLOT_FLOATS). Unweighted, unfiltered, single-token, unsliced only
++// (checked by the host)
++template <int bits, int cb, int MT, bool c_fp32>
++__global__ __launch_bounds__(EXL3_DGEMV_THREADS)
++void exl3_dmgemv_kernel(EXL3_MGEMM_ARGS)
++{
++    const int j = blockIdx.z;
++    const int mat = B_indices ? (int) B_indices[j] : j;
++    if (mat < 0) return;
++    const int n_j = size_n_list ? size_n_list[mat] : size_n;
++    const int ncb = n_j / 128;
++    const int splits = exl3_dgemv_ns::splits_for(size_m, size_k, n_j);
++    const int cbi = blockIdx.x % ncb;
++    const int split = blockIdx.x / ncb;
++    if (split >= splits) return;
++
++    const half* A_j = bszm_in == 1 ? A : A + (size_t) j * size_m * size_k;
++    void* C_j;
++    if (C_list) C_j = C_list[mat];
++    else if constexpr (c_fp32) C_j = (void*) (((float*) C) + (size_t) j * size_m * size_n);
++    else                       C_j = (void*) (((half*) C) + (size_t) j * size_m * size_n);
++
++    float* ws = (float*) (locks + EXL3_DGEMV_CNT_INTS) + (size_t) j * EXL3_DGEMV_SLOT_FLOATS;
++    int* cnt = locks + j * (EXL3_DGEMV_CNT_INTS / EXL3_DGEMV_MAX_SLOTS);
++
++    exl3_dgemv_ns::body<bits, cb, MT, c_fp32>
++    (
++        A_j, (const uint32_t*) B_list[mat], C_j, suh_list[mat], svh_list[mat],
++        ws, cnt, size_m, size_k, n_j, splits, cbi, split
++    );
++}
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+index c909164b..f2605f9a 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+@@ -12,6 +12,9 @@ namespace cg = cooperative_groups;
+ #include "exl3_devctx.cuh"
+ #include "exl3_gemv.cuh"
+ #include "exl3_gemv_int8.cuh"
++#if !defined(USE_ROCM)
++    #include "exl3_dgemv.cuh"
++#endif
+ #include "coop_autotune.cuh"
+ #if defined(USE_ROCM)
+     #include "../rocm/quant/exl3_mgemv_rdna.cuh"
+@@ -217,16 +220,6 @@ int exl3_gemm_gr
+     }
+ #endif
+ 
+-    // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
+-    // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
+-    // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
+-    // to the regular kernel.
+-    if (mul1 && exl3_gemv_int8_enabled())
+-    {
+-        if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
+-            return 0;
+-    }
+-
+     int block_dim;
+     int shape_idx;
+     fp_exl3_gemm_kernel kernel;
+@@ -259,6 +252,35 @@ int exl3_gemm_gr
+         }
+     };
+ 
++#if !defined(USE_ROCM)
++    // Dense decode GEMV (exl3_dgemv.cu), EXL3_DGEMV=1 only: ordinary-launch split-K GEMV for mul1 at
++    // 1..48 rows, ahead of every other path. Same kernel arguments, so graph recording is identical
++    if (force_shape_idx <= 0 && force_num_sms <= 0 && exl3_dgemv_enabled())
++    {
++        void* dk = exl3_dgemv_try_launch
++        (
++            kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32,
++            suh_ptr && A_had_ptr && svh_ptr, device, stream
++        );
++        if (dk)
++        {
++            add_graph_args(dk);
++            cuda_check(cudaPeekAtLastError());
++            return 94;
++        }
++    }
++#endif
++
++    // Experimental fused int8-activation GEMV path (EXL3_INT8_GEMV=1) for mul1 tensors. Rows are
++    // processed as successive GEMV launches, so this is only sensible for small m (the reconstruct
++    // threshold keeps m <= 144 in practice). Not graph-capturable yet; graphed callers fall through
++    // to the regular kernel.
++    if (mul1 && exl3_gemv_int8_enabled())
++    {
++        if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, graph))
++            return 0;
++    }
++
+     // QTIP-style GEMV path for small m (exl3_gemv_kernel.cuh). Same kernel arguments, so graph
+     // recording is identical; falls through to the regular kernel when the heuristic declines
+     if (force_shape_idx <= 0 && force_num_sms <= 0)
+@@ -745,6 +767,26 @@ int exl3_mgemm_gr
+         }
+     };
+ 
++#if !defined(USE_ROCM)
++    // Dense decode GEMV (exl3_dgemv.cu), EXL3_DGEMV=1 only: unweighted, unfiltered, single-token, unsliced fans
++    // (shared expert gate+up) as one ordinary launch, matrix j on gridDim.z
++    if (force_shape_idx <= 0 && force_num_sms <= 0 && exl3_dgemv_enabled())
++    {
++        void* dk = exl3_dmgemv_try_launch
++        (
++            kernelArgs, size_m, size_k, size_n, K, half_k, cb, c_fp32,
++            bszm_in, bszm_out, weights_ptr != nullptr, min_index, num_tokens, had_src_list.has_value(),
++            device, stream
++        );
++        if (dk)
++        {
++            add_graph_args(dk);
++            cuda_check(cudaPeekAtLastError());
++            return 94;
++        }
++    }
++#endif
++
+     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
+     if (autotune)
+     {
+diff --git a/tests/kernels/gemm/test_exl3_dgemv.py b/tests/kernels/gemm/test_exl3_dgemv.py
+new file mode 100644
+index 00000000..ece0d667
+--- /dev/null
++++ b/tests/kernels/gemm/test_exl3_dgemv.py
+@@ -0,0 +1,189 @@
++"""
++Dense decode GEMV (quant/exl3_dgemv.cu, EXL3_DGEMV): the ordinary-launch split-K GEMV that exl3_gemm and
++exl3_mgemm take ahead of every other path when the knob is on (ported from the QMesh R5 exllamav3 fork with K 6 / 7, the
++dense rates of Qwen3.8-Flash-Next). mul1 codebook, integer K in {6, 7}, 1..48 rows, k and n multiples of 128.
++
++- every (K, rows, c_fp32) the runtime can ask for has an instance: a missing one fails here, never
++  silently falls back to the vendor kernel
++- against the fp64 trellis reference at rows 1 / 4 / 6 / 24 / 48 and every K, through exl3_gemm with the
++  path forced (mode 2), half and fp32 output
++- split-K and single-split shapes, repeat launches bit-identical (deterministic reduction order)
++- a fan (exl3_mgemm with per-matrix widths, and with one input per matrix) equals the single launches
++  bit for bit
++- off by default in this tree (not bit-identical to the vendor paths; enabled per run with EXL3_DGEMV=1): unset,
++  every call equals the vendor path bit for bit; mode 1 takes the kernel inside the envelope only
++- Qwen3.8 shapes (2560 -> 640 / 512, 640 -> 2560, 6144 -> 2560) at the decode widths 1..8
++"""
++
++import os
++
++import numpy as np
++import pytest
++import torch
++
++from exllamav3.ext import exllamav3_ext as ext
++from testlib import trellis as tref
++from testlib.env import is_rocm
++from testlib.exl3 import generator, rand_scale
++
++pytestmark = pytest.mark.skipif(is_rocm(), reason = "CUDA-only kernel")
++
++KS = [6, 7]
++ROWS = [1, 4, 6, 24, 48]
++SHAPES = [(1024, 512), (512, 1024), (2048, 384)]   # (k, n): split-K, wide-n, 3-column-block
++
++
++def _weights(k, n, K, seed):
++    g = generator(seed)
++    p = tref.random_packed((k // 16) * (n // 16), K, np.random.default_rng(seed)).reshape(k // 16, n // 16, -1)
++    return p, rand_scale(k, g), rand_scale(n, g), g
++
++
++def _gemm(A, tr, suh, svh, n, fp32, mode):
++    ext.exl3_dgemv_set_enabled(mode)
++    try:
++        C = torch.empty(A.shape[0], n, dtype = torch.float if fp32 else torch.half, device = A.device)
++        ext.exl3_gemm(A, tr, C, suh, torch.empty_like(A), svh, -1, False, True, 0)
++        return C
++    finally:
++        ext.exl3_dgemv_set_enabled(-1)
++
++
++def _assert_close(C, ref):
++    e = C.cpu().double() - ref
++    rel_rms = (e.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()
++    rel_max = (e.abs().max() / ref.abs().max()).item()
++    assert rel_rms < 2.5e-3 and rel_max < 4e-3, f"relative RMS {rel_rms:.2e}, max {rel_max:.2e}"
++
++
++@pytest.mark.parametrize("K", KS)
++def test_instances_exist(K):
++    for m in range(1, 49):
++        for fp32 in (False, True):
++            assert ext.exl3_dgemv_has(K, 2, m, fp32), f"missing exl3_dgemv instance K={K} rows={m} fp32={fp32}"
++    assert not ext.exl3_dgemv_has(K, 1, 4, False), "mcg must not be claimed"
++    assert not ext.exl3_dgemv_has(K, 2, 49, False), "rows > 48 must not be claimed"
++
++
++@pytest.mark.parametrize("K", KS)
++@pytest.mark.parametrize("m", ROWS)
++@pytest.mark.parametrize("k, n", SHAPES)
++@torch.inference_mode()
++def test_matches_reference(device, K, m, k, n):
++    p, suh, svh, g = _weights(k, n, K, K * 100000 + m * 1000 + k + n)
++    A = (torch.randn(m, k, generator = g) * 0.5).half()
++    ref = tref.linear(A, p, suh, svh, K, "mul1")
++    tr = torch.from_numpy(p.copy()).to(device)
++    Ad, sd, vd = A.to(device), suh.to(device), svh.to(device)
++    for fp32 in (False, True):
++        C = _gemm(Ad, tr, sd, vd, n, fp32, 2)
++        _assert_close(C, ref)
++        C2 = _gemm(Ad, tr, sd, vd, n, fp32, 2)
++        assert torch.equal(C, C2), "repeat launch differs"
++
++
++@pytest.mark.skipif(bool(os.environ.get("EXL3_DGEMV")), reason = "EXL3_DGEMV set in the environment")
++@torch.inference_mode()
++def test_default_off_and_envelope(device):
++    """Unset, the knob is mode 0: every call is the vendor path. Mode 1: a 4-row 1024 x 512 call (inside the
++    envelope) takes the new kernel, bit-identical to forcing it (mode 2); a 49-row call stays vendor"""
++    k, n, K = 1024, 512, 6
++    p, suh, svh, g = _weights(k, n, K, 7)
++    tr = torch.from_numpy(p.copy()).to(device)
++    sd, vd = suh.to(device), svh.to(device)
++    assert not ext.exl3_dgemv_enabled()
++    A = (torch.randn(4, k, generator = g) * 0.5).half().to(device)
++    assert torch.equal(_gemm(A, tr, sd, vd, n, False, -1), _gemm(A, tr, sd, vd, n, False, 0))
++    assert torch.equal(_gemm(A, tr, sd, vd, n, False, 1), _gemm(A, tr, sd, vd, n, False, 2))
++    A49 = (torch.randn(49, k, generator = g) * 0.5).half().to(device)
++    assert torch.equal(_gemm(A49, tr, sd, vd, n, False, 1), _gemm(A49, tr, sd, vd, n, False, 0))
++
++
++@pytest.mark.parametrize("K", KS)
++@pytest.mark.parametrize("m", [1, 2, 4, 8])
++@pytest.mark.parametrize("k, n", [(2560, 640), (2560, 512), (640, 2560), (6144, 2560)])
++@torch.inference_mode()
++def test_qwen38_shapes(device, K, m, k, n):
++    p, suh, svh, g = _weights(k, n, K, K * 7919 + m * 31 + k + n)
++    A = (torch.randn(m, k, generator = g) * 0.5).half()
++    ref = tref.linear(A, p, suh, svh, K, "mul1")
++    tr = torch.from_numpy(p.copy()).to(device)
++    Ad, sd, vd = A.to(device), suh.to(device), svh.to(device)
++    for fp32 in (False, True):
++        _assert_close(_gemm(Ad, tr, sd, vd, n, fp32, 2), ref)
++
++
++def _ptrs(ts, device):
++    return torch.tensor([t.data_ptr() for t in ts], dtype = torch.long, device = device)
++
++
++@pytest.mark.parametrize("K", [6, 7])
++@pytest.mark.parametrize("m", [1, 6, 24])
++@torch.inference_mode()
++def test_fans_equal_single_launches(device, K, m):
++    k = 1024
++    ns = [1024, 512, 256]
++    mats = [_weights(k, n, K, 31 * K + i) for i, n in enumerate(ns)]
++    tr = [torch.from_numpy(p.copy()).to(device) for p, _, _, _ in mats]
++    su = [s.to(device) for _, s, _, _ in mats]
++    sv = [v.to(device) for _, _, v, _ in mats]
++    g = generator(m)
++    x = (torch.randn(1, m, k, generator = g) * 0.5).half().to(device)
++
++    # shared input, per-matrix widths (the x-side projection fan)
++    outs = [torch.empty(m, n, dtype = torch.half, device = device) for n in ns]
++    ext.exl3_dgemv_set_enabled(2)
++    try:
++        ext.exl3_mgemm(
++            x, _ptrs(tr, device), outs[0].view(1, m, -1), _ptrs(su, device), torch.empty(3, m, k, dtype = torch.half, device = device),
++            _ptrs(sv, device), torch.arange(3, dtype = torch.long, device = device).unsqueeze(0), None, K, -1, False, True,
++            -1, -1, 0, 1, torch.tensor(ns, dtype = torch.int32, device = device), _ptrs(outs, device))
++        for i, n in enumerate(ns):
++            C = _gemm(x[0], tr[i], su[i], sv[i], n, False, 2)
++            assert torch.equal(C, outs[i]), f"fan output {i} differs from its single launch"
++
++        # one input per matrix, uniform width (wo_a's grouped slices)
++        trs = tr[:1] * 3
++        xs = (torch.randn(3, m, k, generator = g) * 0.5).half().to(device)
++        C3 = torch.empty(3, m, ns[0], dtype = torch.half, device = device)
++        ext.exl3_dgemv_set_enabled(2)    # _gemm above restored the env mode
++        ext.exl3_mgemm(
++            xs, _ptrs(trs, device), C3, _ptrs(su[:1] * 3, device), torch.empty(3, m, k, dtype = torch.half, device = device),
++            _ptrs(sv[:1] * 3, device), None, None, K, -1, False, True, -1, -1, 0, 1, None, None)
++        for j in range(3):
++            C = _gemm(xs[j], tr[0], su[0], sv[0], ns[0], False, 2)
++            assert torch.equal(C, C3[j]), f"per-input slot {j} differs from its single launch"
++    finally:
++        ext.exl3_dgemv_set_enabled(-1)
++
++
++@pytest.mark.parametrize("m", [4, 24])
++@torch.inference_mode()
++def test_graph_replay_matches_eager(device, m):
++    """The workspace pointer is baked into a captured graph and the split counters self-reset: replays
++    must reproduce the eager result bit for bit, repeatedly"""
++    k, n, K = 2048, 512, 6
++    p, suh, svh, g = _weights(k, n, K, 99 + m)
++    A = (torch.randn(m, k, generator = g) * 0.5).half().to(device)
++    tr = torch.from_numpy(p.copy()).to(device)
++    sd, vd = suh.to(device), svh.to(device)
++    ref = _gemm(A, tr, sd, vd, n, False, 2)
++    C = torch.empty(m, n, dtype = torch.half, device = device)
++    Ah = torch.empty_like(A)
++    ext.exl3_dgemv_set_enabled(2)
++    try:
++        s = torch.cuda.Stream(device)
++        s.wait_stream(torch.cuda.current_stream(device))
++        gr = torch.cuda.CUDAGraph()
++        with torch.cuda.stream(s):
++            ext.exl3_gemm(A, tr, C, sd, Ah, vd, -1, False, True, 0)
++            torch.cuda.synchronize(device)
++            with torch.cuda.graph(gr, stream = s):
++                ext.exl3_gemm(A, tr, C, sd, Ah, vd, -1, False, True, 0)
++        for _ in range(3):
++            C.zero_()
++            gr.replay()
++            torch.cuda.synchronize(device)
++            assert torch.equal(C, ref)
++    finally:
++        ext.exl3_dgemv_set_enabled(-1)
+-- 
+2.43.0
+

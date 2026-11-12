@@ -1,0 +1,181 @@
+From 25c86f383646e4d6cdc7116a1bc1d4d72925818c Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:23:40 -0500
+Subject: [PATCH 6/7] Generator: adaptive prefill chunks
+ (EXL3_PREFILL_ADAPTIVE, default off)
+
+Per-chunk memory limiter ported from QMesh R5 (qmesh/prefill_limit.py): shrinks each planned prefill chunk to fit free device memory. Opt-in; changes chunk boundaries and therefore long-context numerics.
+---
+ exllamav3/generator/generator.py     |   7 ++
+ exllamav3/generator/job.py           |  10 +++
+ exllamav3/generator/prefill_limit.py | 105 +++++++++++++++++++++++++++
+ 3 files changed, 122 insertions(+)
+ create mode 100644 exllamav3/generator/prefill_limit.py
+
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index a3c422da..2c986392 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -15,6 +15,7 @@ from .cpu_cache import CPUPageCache
+ from .disk_cache import DiskPageCache
+ from .draft_confidence import DraftConfidenceCalibrator
+ from .job import Job
++from .prefill_limit import PREFILL_ADAPTIVE, PrefillChunkLimiter
+ from .filter import Filter
+ from concurrent.futures import ThreadPoolExecutor
+ from .sampler import Sampler
+@@ -270,6 +271,12 @@ class Generator:
+         self.max_batch_size = max_batch_size
+         self.max_chunk_size = max_chunk_size
+ 
++        # Adaptive prefill chunks (prefill_limit.py): shrink a planned chunk to what device memory allows.
++        # Single-device runs only; multi-device and TP runs keep fixed chunks
++        self.prefill_chunk_limit = None
++        if PREFILL_ADAPTIVE and torch.cuda.is_available() and len(self.model.active_devices) == 1:
++            self.prefill_chunk_limit = PrefillChunkLimiter(torch.device(self.model.active_devices[0]))
++
+         # Prompt ingestion alongside generating jobs, see iterate()
+         if shared_chunk_size is None:
+             shared_chunk_size = (max_chunk_size // 2 + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
+diff --git a/exllamav3/generator/job.py b/exllamav3/generator/job.py
+index 0e244e4b..80fd2863 100644
+--- a/exllamav3/generator/job.py
++++ b/exllamav3/generator/job.py
+@@ -1449,6 +1449,14 @@ class Job:
+             if chunk_size is not None:
+                 prefill_end = min(prefill_end, (prefill_start + chunk_size) // PAGE_SIZE * PAGE_SIZE)
+ 
++            # Adaptive limit (memory headroom): only ever shortens a chunk, to whole pages from prefill_start
++            # (at least one); a chunk already a single page or the prompt's tail is left as is
++            limit = self.generator.prefill_chunk_limit
++            if limit is not None and prefill_end - prefill_start > PAGE_SIZE:
++                allowed = limit(prefill_start, prefill_end - prefill_start)
++                if allowed < prefill_end - prefill_start:
++                    prefill_end = prefill_start + max(PAGE_SIZE, allowed // PAGE_SIZE * PAGE_SIZE)
++
+             if prefill_end <= prefill_start:
+                 continue
+ 
+@@ -1670,6 +1678,8 @@ class Job:
+                 progress += prefill_end - prefill_start
+                 if self.sequences[0].kv_position >= len(seq.sequence_ids) - 1:
+                     seq.prefill_complete = True
++                    if self.generator.prefill_chunk_limit is not None:
++                        self.generator.prefill_chunk_limit.prefill_done()
+ 
+                 if recurrent_last_page:
+                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
+diff --git a/exllamav3/generator/prefill_limit.py b/exllamav3/generator/prefill_limit.py
+new file mode 100644
+index 00000000..ea367a4c
+--- /dev/null
++++ b/exllamav3/generator/prefill_limit.py
+@@ -0,0 +1,105 @@
++"""
++Adaptive prefill chunk limiter (memory headroom guard).
++
++Ported from QMesh R5 (GPTwareAiTeam/QMesh-1xRTXPro6000-1xGB10, qmesh/prefill_limit.py, MIT). Before every
++prefill forward it reads free device memory once and shrinks the planned chunk to the largest page-aligned
++row count whose predicted transient fits under a safety margin. A large configured chunk (e.g. 16384) then
++runs at full size while memory allows, and degrades instead of running out of memory when the KV pool is
++sized to the card.
++
++Transient model: rise(start, rows) = max(row_bytes * rows, depth_base + depth_bytes * (start + rows)).
++The row term covers activations (the dominant term on Qwen3.8-Flash-Next); the depth term guards very deep
++chunks. Refit per deployment with EXL3_PREFILL_ADAPTIVE_LOG=1, which prints measured rise against
++prediction for every chunk.
++
++  EXL3_PREFILL_ADAPTIVE      1 = on, 0 = fixed chunks (default; V2 measured shrunk chunks moving long-context KL)
++  EXL3_PREFILL_ROW_KIB       activation bytes per prefill row, KiB
++  EXL3_PREFILL_FIRST_ROW_KIB extra per row on a prompt's first chunk (one-time buffers), KiB
++  EXL3_PREFILL_DEPTH_BASE_MIB, EXL3_PREFILL_DEPTH_BYTES   depth term
++  EXL3_PREFILL_MARGIN_MIB    free memory kept on the card at the predicted peak
++"""
++from __future__ import annotations
++
++import os
++import time
++
++import torch
++
++from ..constants import PAGE_SIZE
++
++PREFILL_ADAPTIVE = os.environ.get("EXL3_PREFILL_ADAPTIVE", "0") == "1"
++PREFILL_ROW_BYTES = float(os.environ.get("EXL3_PREFILL_ROW_KIB", "256")) * 2 ** 10
++PREFILL_FIRST_ROW_BYTES = float(os.environ.get("EXL3_PREFILL_FIRST_ROW_KIB", "32")) * 2 ** 10
++PREFILL_DEPTH_BASE = float(os.environ.get("EXL3_PREFILL_DEPTH_BASE_MIB", "256")) * 2 ** 20
++PREFILL_DEPTH_BYTES = float(os.environ.get("EXL3_PREFILL_DEPTH_BYTES", "0"))
++PREFILL_MARGIN_MIB = float(os.environ.get("EXL3_PREFILL_MARGIN_MIB", "1024"))
++PREFILL_ADAPTIVE_LOG = os.environ.get("EXL3_PREFILL_ADAPTIVE_LOG", "0") == "1"
++
++
++def _log(message):
++    print(message, flush = True)
++
++
++def prefill_rise(start: int, rows: int) -> float:
++    """Predicted transient bytes over the steady allocation for a chunk of `rows` starting at `start`"""
++    row_bytes = PREFILL_ROW_BYTES + (PREFILL_FIRST_ROW_BYTES if start == 0 else 0.0)
++    deep = PREFILL_DEPTH_BASE + PREFILL_DEPTH_BYTES * (start + rows)
++    return max(row_bytes * rows, deep)
++
++
++def prefill_fit(start: int, room: float) -> float:
++    """Largest row count whose prefill_rise at `start` is <= room"""
++    row_bytes = PREFILL_ROW_BYTES + (PREFILL_FIRST_ROW_BYTES if start == 0 else 0.0)
++    by_rows = room / row_bytes
++    if PREFILL_DEPTH_BYTES <= 0:
++        return by_rows if room >= PREFILL_DEPTH_BASE else 0.0
++    by_depth = (room - PREFILL_DEPTH_BASE - PREFILL_DEPTH_BYTES * start) / PREFILL_DEPTH_BYTES
++    return min(by_rows, by_depth)
++
++
++class PrefillChunkLimiter:
++    """One free-memory read and one solve per prefill chunk: the largest page-aligned chunk that fits, at most
++    the planned chunk and at least one page"""
++
++    def __init__(self, device):
++        self.device = device
++        self.prev = None
++        self.chunks = 0
++        self.shrunk = 0
++
++    def __call__(self, start: int, chunk: int) -> int:
++        dev = self.device
++        alloc = torch.cuda.memory_allocated(dev)
++        if PREFILL_ADAPTIVE_LOG and self.prev is not None:
++            p_start, p_rows, p_alloc, p_t = self.prev
++            peak = torch.cuda.max_memory_allocated(dev)
++            dt = time.perf_counter() - p_t
++            _log(f"PREFILL_CHUNK_PEAK start={p_start} rows={p_rows} rise_MiB={(peak - p_alloc) / 2**20:.0f} "
++                 f"predicted_MiB={prefill_rise(p_start, p_rows) / 2**20:.0f} ms={dt * 1e3:.0f}")
++        torch.cuda.reset_peak_memory_stats(dev)
++        # Torch's held-but-free blocks count as usable (expandable segments let a freed block serve any shape);
++        # the margin stays free on the card
++        free, _ = torch.cuda.mem_get_info(dev)
++        reserved = torch.cuda.memory_reserved(dev)
++        room = free + reserved - alloc - PREFILL_MARGIN_MIB * 2 ** 20
++        rows = max(PAGE_SIZE, min(chunk, int(prefill_fit(start, room)) // PAGE_SIZE * PAGE_SIZE))
++        self.chunks += 1
++        if rows < chunk:
++            self.shrunk += 1
++        if PREFILL_ADAPTIVE_LOG:
++            _log(f"PREFILL_CHUNK_ADAPT start={start} planned={chunk} rows={rows} room_MiB={room / 2**20:.0f} "
++                 f"free_MiB={free / 2**20:.0f} reserved_MiB={reserved / 2**20:.0f} alloc_MiB={alloc / 2**20:.0f}")
++        self.prev = (start, rows, alloc, time.perf_counter())
++        return rows
++
++    def prefill_done(self):
++        """A prompt's prefill finished: log the last chunk's rise, then return torch's held-but-free blocks to
++        the card so decode-time graph captures (separate pool) find free memory after a large-chunk prefill"""
++        dev = self.device
++        if PREFILL_ADAPTIVE_LOG and self.prev is not None:
++            p_start, p_rows, p_alloc, _ = self.prev
++            _log(f"PREFILL_DONE start={p_start} rows={p_rows} "
++                 f"rise_MiB={(torch.cuda.max_memory_allocated(dev) - p_alloc) / 2**20:.0f} "
++                 f"predicted_MiB={prefill_rise(p_start, p_rows) / 2**20:.0f}")
++        self.prev = None
++        torch.cuda.empty_cache()
+-- 
+2.43.0
+
