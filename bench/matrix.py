@@ -1,8 +1,9 @@
 import json, time, urllib.request, concurrent.futures as cf, random, string, statistics as st
 import os
 U=os.environ.get("BASE_URL","http://127.0.0.1:5000")+"/v1/completions"; M=os.environ.get("MODEL","Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8")
+HDR={"Content-Type":"application/json",**({"Authorization":"Bearer "+os.environ["API_KEY"]} if os.environ.get("API_KEY") else {})}
 def post(body, timeout=1800):
-    r=urllib.request.Request(U, json.dumps(body).encode(), {"Content-Type":"application/json"})
+    r=urllib.request.Request(U, json.dumps(body).encode(), HDR)
     t=time.time(); d=json.load(urllib.request.urlopen(r, timeout=timeout)); return time.time()-t, d
 def nonce(): return "".join(random.choices(string.hexdigits.lower(), k=10))
 SEED={
@@ -27,12 +28,16 @@ def one(tag, ptarget, nout):
 def med(xs): return st.median(xs)
 # warmup: autotune + draft calibrator
 post({"model":M,"prompt":"Warmup. " * 20,"max_tokens":256,"temperature":0})
-print("=== concurrency (512 new tokens, mixed code prompt, median of 3)", flush=True)
+# CONC="1,2,4,8" (default), REPS=3, SECTIONS="concurrency,prefill,decode" select what runs, e.g. CONC=1 REPS=1
+# SECTIONS=concurrency for a single c1 point
+CONC=[int(x) for x in os.environ.get("CONC","1,2,4,8").split(",")]; REPS=int(os.environ.get("REPS","3"))
+SECTIONS=os.environ.get("SECTIONS","concurrency,prefill,decode").split(",")
+if "concurrency" in SECTIONS: print(f"=== concurrency (512 new tokens, mixed code prompt, median of {REPS})", flush=True)
 CP="Write a Python implementation of a binary heap with push, pop, and heapify, plus a test harness."
 res={}
-for conc in (1,2,4,8):
+for conc in (CONC if "concurrency" in SECTIONS else []):
     aggs=[]; pers=[]
-    for _ in range(3):
+    for _ in range(REPS):
         t=time.time()
         with cf.ThreadPoolExecutor(conc) as ex:
             out=list(ex.map(lambda _: post({"model":M,"prompt":CP,"max_tokens":512,"temperature":0}), range(conc)))
@@ -40,13 +45,13 @@ for conc in (1,2,4,8):
         toks=sum(d["usage"]["completion_tokens"] for _,d in out)
         aggs.append(toks/wall); pers.append(med([d["usage"]["completion_tokens"]/w for w,d in out]))
     print(f"conc={conc}: agg median={med(aggs):6.1f} t/s (runs {[round(a,1) for a in aggs]})  per-stream median={med(pers):5.1f} t/s", flush=True)
-print("=== prefill ~2048 tokens -> 1 output token (median of 3)", flush=True)
-for tag in SEED:
+if "prefill" in SECTIONS: print("=== prefill ~2048 tokens -> 1 output token (median of 3)", flush=True)
+for tag in (SEED if "prefill" in SECTIONS else []):
     rows=[one(tag, 2048, 1) for _ in range(3)]
     pt=med([r[0] for r in rows]); w=med([r[2] for r in rows])
     print(f"{tag:5s}: ptok={pt} wall={w*1000:6.0f} ms prefill={pt/w:6.0f} tok/s (runs {[round(r[2]*1000) for r in rows]} ms)", flush=True)
-print("=== ~128 prompt tokens -> 2048 decode (median of 3)", flush=True)
-for tag in SEED:
+if "decode" in SECTIONS: print("=== ~128 prompt tokens -> 2048 decode (median of 3)", flush=True)
+for tag in (SEED if "decode" in SECTIONS else []):
     rows=[one(tag, 128, 2048) for _ in range(3)]
     ct=med([r[1] for r in rows]); w=med([r[2] for r in rows])
     acc=med([r[3] for r in rows]); rej=med([r[4] for r in rows])

@@ -1,8 +1,9 @@
 import json,time,urllib.request,statistics as st
 import os
 U=os.environ.get("BASE_URL","http://127.0.0.1:5000")+"/v1/completions"; M=os.environ.get("MODEL","Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8")
+HDR={"Content-Type":"application/json",**({"Authorization":"Bearer "+os.environ["API_KEY"]} if os.environ.get("API_KEY") else {})}
 def post(b,t=1800):
-    r=urllib.request.Request(U,json.dumps(b).encode(),{"Content-Type":"application/json"})
+    r=urllib.request.Request(U,json.dumps(b).encode(),HDR)
     s=time.time(); d=json.load(urllib.request.urlopen(r,timeout=t)); return time.time()-s,d
 P={
 "prose":("Write a long, detailed essay about how a coastal town's economy changed after the fishing fleet "
@@ -18,11 +19,14 @@ P={
  "compute the sum from 1 to 2500 and verify the result with a second method. Show every step."),
 }
 post({"model":M,"prompt":"Warmup. "*20,"max_tokens":128,"temperature":0})
-print("=== natural ~60-token prompt -> forced 2048 decode, median of 3", flush=True)
+# SAMPLING=greedy (default) sends temperature 0; SAMPLING=preset omits it, so the server's sampling preset
+# (deploy/config.yml: qwen38_thinking, temperature 0.6, top_k 20, top_p 0.95) applies
+SAMPLE={"temperature":0} if os.environ.get("SAMPLING","greedy")=="greedy" else {}
+print(f"=== natural ~60-token prompt -> forced 2048 decode, median of 3, sampling={os.environ.get('SAMPLING','greedy')}", flush=True)
 for tag,p in P.items():
     rows=[]
     for _ in range(3):
-        w,d=post({"model":M,"prompt":p,"max_tokens":2048,"min_tokens":2048,"temperature":0,"loop_detect_window":0})
+        w,d=post({"model":M,"prompt":p,"max_tokens":2048,"min_tokens":2048,"loop_detect_window":0,**SAMPLE})
         u=d["usage"]; det=d["usage"].get("completion_tokens_details") or {}
         rows.append((u["prompt_tokens"],u["completion_tokens"],w,det.get("accepted_prediction_tokens") or 0,det.get("rejected_prediction_tokens") or 0))
     ct=st.median([r[1] for r in rows]); w=st.median([r[2] for r in rows])
