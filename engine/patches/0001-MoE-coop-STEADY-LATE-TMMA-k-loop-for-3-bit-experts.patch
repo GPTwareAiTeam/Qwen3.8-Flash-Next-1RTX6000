@@ -1,0 +1,499 @@
+From 3929ccfe3d4a3653997170ec0ac0be99a75f09de Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:23:39 -0500
+Subject: [PATCH 1/7] MoE coop: STEADY/LATE/TMMA k-loop for 3-bit experts
+
+Port of the cooperative MoE decode k-loop from the QMesh R5 exllamav3 fork: full-ring iterations without bounds checks, late decode from the ring, one m16n8k16 per tile. Bit-identical outputs; c1 +4.7 %, c2/c4 +9 % on Qwen3.8-Flash-Next.
+---
+ .../exllamav3_ext/quant/exl3_moe_coop.cuh     |   8 +
+ .../quant/exl3_moe_coop_kernel.cuh            | 322 +++++++++++++-----
+ tests/kernels/moe/test_moe_coop.py            |  16 +
+ 3 files changed, 270 insertions(+), 76 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+index 3bf30613..cc9fade0 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh
+@@ -14,7 +14,15 @@
+ #define MOE_COOP_ACT_RELU2 2
+ #define MOE_COOP_ACT_SILU_OAI 3
+ 
++// Block size of the coop kernels (16 warps; the R5 fork runs 8 warps, -DMOE_COOP_THREADS=256, which changes the k
++// split per warp and so the fp32 summation order: a numerics change, measured only as a bench variant here) and the
++// launch-bounds minimum blocks per SM (0: none)
++#ifndef MOE_COOP_THREADS
+ #define MOE_COOP_THREADS 512
++#endif
++#ifndef MOE_COOP_MINB
++#define MOE_COOP_MINB 0
++#endif
+ #define MOE_COOP_WNT 2                  // adjacent 16-column tiles per warp (32-column groups per block)
+ #define MOE_COOP_COLS (MOE_COOP_WNT * 16)
+ 
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+index ce8a2f1e..d2134efc 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+@@ -31,7 +31,7 @@
+ 
+ namespace exl3_moe_coop_ns {
+ 
+-constexpr int WK = 16;                          // k-split (warps per block)
++constexpr int WK = MOE_COOP_THREADS / 32;       // k-split (warps per block)
+ constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
+ constexpr int PF = 4;                           // prefetch ring depth
+ constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
+@@ -48,6 +48,13 @@ constexpr int STAGE_WORDS = WNT * 8 * 8;        // words per warp per k-slice at
+ constexpr float R_SCALE = 0.088388347648f;      // 1/sqrt(128)
+ 
+ static_assert(THREADS == MOE_COOP_THREADS, "block size mismatch");
++static_assert(WK == 8 || WK == 16, "coop block: 8 or 16 warps");
++
++#if MOE_COOP_MINB > 0
++#define MOE_COOP_BOUNDS __launch_bounds__(THREADS, MOE_COOP_MINB)
++#else
++#define MOE_COOP_BOUNDS __launch_bounds__(THREADS)
++#endif
+ 
+ // Register-dequant widths (shuffle extraction, no staging). 3 bpw stays on the staged generic
+ // path on Ampere where its register form loses to the block-pipelined kernel)
+@@ -337,6 +344,63 @@ __device__ __forceinline__ bool read_run(const MoeCoopParams& p, int run_idx, in
+ // 2/3/4 bpw; other widths stage each k-slice's tile words in shared memory and decode with
+ // dq_dispatch
+ 
++// k-loop form (ported from the QMesh R5 exllamav3 fork (github.com/GPTwareAiTeam/QMesh-1xRTXPro6000-1xGB10); each bit-identical to the previous loop
++// there on every measured K / row count; default on, = 0 restores the previous form for A/B):
++//   EXL3_MOE_STEADY    full-ring iterations of the k loop run without bounds checks and with compile-time fold points;
++//                      the partial-warp loads of 3 bpw register tiles clamp the lane instead of predicating it (lanes
++//                      past the tile re-read its last word and are never shuffled from)
++//   EXL3_MOE_LATE      decode straight from the ring slot and refill it after the slice's MMAs (no register copy of
++//                      the slot; PF - 1 slices of load lead instead of PF)
++//   EXL3_MOE_TMMA      transposed tile product: the decoded weight registers (f0[0], f1[0], f0[1], f1[1]) are the
++//                      m16n8k16 A fragment of W^T (16 columns x 16 k) and the activation words the B fragment (16 k x 8
++//                      rows), so one MMA per 16x16 tile instead of two whose A rows 8-15 are zero. Same products, same
++//                      fp16 accumulator chain and fold points. CUDA sm_80+ only (sm_75 splits the MMA in k halves, ROCm
++//                      has its own fragment layout); elsewhere the two-MMA form stays
++#ifndef EXL3_MOE_STEADY
++#define EXL3_MOE_STEADY 1
++#endif
++#ifndef EXL3_MOE_LATE
++#define EXL3_MOE_LATE 1
++#endif
++#ifndef EXL3_MOE_TMMA
++#define EXL3_MOE_TMMA 1
++#endif
++#if EXL3_MOE_TMMA && !defined(USE_ROCM) && !EXL3_SM75
++#define EXL3_MOE_TMMA_ON 1
++#else
++#define EXL3_MOE_TMMA_ON 0
++#endif
++
++#if EXL3_MOE_TMMA_ON
++// Transposed tile product (EXL3_MOE_TMMA): C^T (16 columns x 8 rows) += W^T (16 x 16 k) * X^T (16 k x 8 rows). The A
++// fragment of W^T is the decoded B fragments of W in the order (f0[0], f1[0], f0[1], f1[1]); the B fragment of X^T is
++// the activation words (row lane/4, k pairs 2(lane%4) and +8). c[0] = (column lane/4, rows 2(lane%4), +1),
++// c[1] = (column 8 + lane/4, same rows)
++__device__ __forceinline__ void mma_t_h(const FragB& f0, const FragB& f1, uint2 aw, FragC_h& c)
++{
++    const uint32_t* w0 = reinterpret_cast<const uint32_t*>(&f0);
++    const uint32_t* w1 = reinterpret_cast<const uint32_t*>(&f1);
++    uint32_t* cc = reinterpret_cast<uint32_t*>(&c);
++    asm
++    (
++        "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
++        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
++        : "+r"(cc[0]), "+r"(cc[1])
++        :  "r"(w0[0]), "r"(w1[0]), "r"(w0[1]), "r"(w1[1]),
++           "r"(aw.x), "r"(aw.y)
++    );
++}
++#endif
++
++// EXL3_MOE_HALF_REG: 2.5 / 3.5 (and 1.5) bpw decode from registers by lane shuffles, as exl3_gemv_kernel does, instead
++// of staging every k-slice through shared memory (R5 fork switch, default off there and unmeasured; Qwen3.8's outer
++// 8 MoE layers are 3.5 bpw, so it is measured here). Same words, same decode: same outputs
++#ifndef EXL3_MOE_HALF_REG
++#define EXL3_MOE_HALF_REG 0
++#endif
++template <int bits, bool HALF>
++constexpr bool tile_reg_k() { return HALF ? (EXL3_MOE_HALF_REG != 0) : tile_reg<bits>(); }
++
+ template <int bits, int cb, bool WIDE, bool HALF = false>
+ __device__ __forceinline__ void gemv_tile
+ (
+@@ -356,11 +420,13 @@ __device__ __forceinline__ void gemv_tile
+     uint32_t* __restrict__ sh_stage     // [WK][STAGE_WORDS], staged widths only
+ )
+ {
+-    constexpr bool REG = HALF ? false : tile_reg<bits>();
++    constexpr bool REG = tile_reg_k<bits, HALF>();
+     constexpr int TWORDS = HALF ? 4 * (2 * bits + 1) : 8 * bits;              // uint32 per 16x16 tile
+     constexpr int GWORDS = WNT * TWORDS;                                        // uint32 per warp per k-slice
+-    constexpr int LOADS = REG ? (bits == 2 ? WNT / 2 : WNT) : CEIL_DIVIDE(GWORDS, 32);
+-    constexpr int LSTRIDE = (REG && bits == 3) ? 24 : 32;
++    constexpr bool HALF_TWO = HALF && bits == 1;                                // 1.5 bpw: two tiles per load
++    constexpr int LOADS = REG ? (HALF ? (bits == 1 ? WNT / 2 : WNT) : (bits == 2 ? WNT / 2 : WNT)) : CEIL_DIVIDE(GWORDS, 32);
++    constexpr int LSTRIDE = (REG && HALF) ? (HALF_TWO ? 2 * TWORDS : TWORDS) : (REG && bits == 3) ? 24 : 32;
++    static_assert(PF % FOLD == 0, "fold cadence must divide the ring depth");
+     constexpr int WN = tile_wn<WIDE>();
+     constexpr int WKK = tile_wk<WIDE>();
+     constexpr int TCOLS = tile_cols<WIDE>();
+@@ -383,13 +449,27 @@ __device__ __forceinline__ void gemv_tile
+     const half2 hzero = __half2half2(__ushort_as_half(0));
+ 
+     [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+-    if constexpr (bits == 2)
++    [[maybe_unused]] uint32_t x_pack = 0;
++    if constexpr (HALF)
++    {
++        // Same lane constants as exl3_gemv_kernel's half-integer path / dq8_half: word indices (< TWORDS) and
++        // funnel shifts of both window groups, six 5-bit fields
++        constexpr int bits2 = 2 * bits + 1;
++        constexpr int gspan = 18 + 3 * bits;
++        const int t_offset = lane << 3;
++        const int e7 = ((t_offset >> 1) + 4) * bits2 + 128 * bits2;
++        const int e3 = e7 - 2 * bits2;
++        const uint32_t hi7 = ((e7 - 1) / 32) % TWORDS, lo7 = ((e7 - gspan) / 32) % TWORDS, s7 = ((e7 - 1) / 32 + 1) * 32 - e7;
++        const uint32_t hi3 = ((e3 - 1) / 32) % TWORDS, lo3 = ((e3 - gspan) / 32) % TWORDS, s3 = ((e3 - 1) / 32 + 1) * 32 - e3;
++        x_pack = lo7 | (hi7 << 5) | (s7 << 10) | (lo3 << 15) | (hi3 << 20) | (s3 << 25);
++    }
++    else if constexpr (bits == 2)
+     {
+         int i1 = lane >> 1;
+         x_src_b = i1;
+         x_src_a = (i1 + 15) & 15;
+     }
+-    if constexpr (bits == 3)
++    else if constexpr (bits == 3)
+     {
+         int t_offset = lane << 3;
+         int b1 = (t_offset + 257) * 3;
+@@ -400,13 +480,22 @@ __device__ __forceinline__ void gemv_tile
+         x_src_a = i0 % 24;
+         x_src_b = i2 % 24;
+     }
++    #define XPK(i) ((x_pack >> (5 * (i))) & 31u)   // 0: lo7, 1: hi7, 2: s7, 3: lo3, 4: hi3, 5: s3
+ 
+-    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + lane;
++    // Partial-warp register tiles (3 bpw, half-integer): STEADY loads every lane, lanes past the tile re-reading the
++    // tile's last word (same sector, never shuffled from) instead of a predicated load
++    constexpr bool CLAMP = EXL3_MOE_STEADY && REG && (bits == 3 || HALF);
++    const int lane_ld = CLAMP ? min(lane, (HALF ? LSTRIDE : 24) - 1) : lane;
++    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + (group * WN + wn) * GWORDS + lane_ld;
+     [[maybe_unused]] uint32_t* stage = sh_stage + warp * STAGE_WORDS;
+ 
+     auto ld_b = [&] (int i, int l) -> uint32_t
+     {
+-        if constexpr (REG && bits == 3)
++        if constexpr (CLAMP)
++            return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
++        else if constexpr (REG && HALF)
++            return lane < LSTRIDE ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
++        else if constexpr (REG && bits == 3)
+             return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+         else if constexpr (!REG)
+             return (l * 32 + lane < GWORDS) ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+@@ -425,93 +514,173 @@ __device__ __forceinline__ void gemv_tile
+     FragC_h ch[WNT][2] = {};
+     float2 acc0[WNT][2] = {};
+ 
+-    for (int ib = 0; ib < myn; ib += PF)
++    // A fragment words of slice i: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
++    auto ld_a = [&] (int i) -> uint2
+     {
+-        #pragma unroll
+-        for (int d = 0; d < PF; ++d)
+-        {
+-            const int i = ib + d;
+-            if (i >= myn) break;
++        const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
++        const uint32_t* ap = reinterpret_cast<const uint32_t*>(A2) + a_row0 + a_col;
++        return r0_ok ? make_uint2(ap[0], ap[4]) : make_uint2(0u, 0u);
++    };
+ 
+-            uint32_t bw[LOADS];
++    // One k-slice: decode of the slice's weight words bw, MMAs against its A fragment aw, fp32 fold on the fixed
++    // cadence (every FOLD slices of the warp's range, and at its end), identical for every loop form. fold: 1 = fold
++    // now, 0 = don't, -1 = decide at run time from i
++    auto step = [&] (int i, const uint32_t (&bw)[LOADS], uint2 aw, int fold)
++    {
++        if constexpr (!REG)
++        {
++            __syncwarp();
+             #pragma unroll
+             for (int l = 0; l < LOADS; ++l)
+-                bw[l] = pf[d][l];
++                if (l * 32 + lane < GWORDS)
++                    stage[l * 32 + lane] = bw[l];
++            __syncwarp();
++        }
+ 
+-            if (i + PF < myn)
+-            {
+-                #pragma unroll
+-                for (int l = 0; l < LOADS; ++l)
+-                    pf[d][l] = ld_b(i + PF, l);
+-            }
++        [[maybe_unused]] FragB a01, a23;      // two-MMA form only; TMMA takes aw directly
++        reinterpret_cast<uint32_t&>(a01[0]) = aw.x;
++        reinterpret_cast<uint32_t&>(a23[0]) = aw.y;
++        a01[1] = hzero;
++        a23[1] = hzero;
+ 
++        #pragma unroll
++        for (int t = 0; t < WNT; ++t)
++        {
++            FragB f0, f1;
+             if constexpr (!REG)
+             {
+-                __syncwarp();
+-                #pragma unroll
+-                for (int l = 0; l < LOADS; ++l)
+-                    if (l * 32 + lane < GWORDS)
+-                        stage[l * 32 + lane] = bw[l];
+-                __syncwarp();
++                dq_dispatch<bits, cb, HALF>(stage + t * TWORDS, lane << 3, f0, f1);
++            }
++            else if constexpr (HALF)
++            {
++                const uint32_t w = HALF_TWO ? bw[t >> 1] : bw[t];
++                const int base = HALF_TWO ? (t & 1) * TWORDS : 0;
++                uint32_t a7 = __shfl_sync(0xffffffffu, w, base + XPK(0));
++                uint32_t b7 = __shfl_sync(0xffffffffu, w, base + XPK(1));
++                uint32_t a3 = __shfl_sync(0xffffffffu, w, base + XPK(3));
++                uint32_t b3 = __shfl_sync(0xffffffffu, w, base + XPK(4));
++                exl3_gemv_ns::dq8_regs_half<bits, cb>(a7, b7, XPK(2), a3, b3, XPK(5), f0, f1);
++            }
++            else if constexpr (bits == 4)
++            {
++                uint32_t aw4 = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
++                exl3_gemv_ns::dq8_regs_4bits<cb>(aw4, bw[t], f0, f1);
++            }
++            else if constexpr (bits == 2)
++            {
++                const uint32_t w = bw[t >> 1];
++                const int base = (t & 1) << 4;
++                uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
++                uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
++                exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
++            }
++            else  // bits == 3
++            {
++                uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
++                uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
++                exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+             }
+ 
+-            // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
+-            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
+-            FragB a01, a23;
+-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+-            a01[1] = hzero;
+-            a23[1] = hzero;
++#if EXL3_MOE_TMMA_ON
++            {
++                // Transposed accumulator: ch[t][f][0] = (column t * 16 + f * 8 + lane / 4, rows 2 (lane % 4), +1)
++                FragC_h c;
++                c[0] = ch[t][0][0];
++                c[1] = ch[t][1][0];
++                mma_t_h(f0, f1, aw, c);
++                ch[t][0][0] = c[0];
++                ch[t][1][0] = c[1];
++            }
++#else
++            exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
++            exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
++#endif
++        }
+ 
++        if (fold > 0 || (fold < 0 && ((i + 1) % FOLD == 0 || i + 1 == myn)))
++        {
+             #pragma unroll
+             for (int t = 0; t < WNT; ++t)
+-            {
+-                FragB f0, f1;
+-                if constexpr (!REG)
+-                {
+-                    dq_dispatch<bits, cb, HALF>(stage + t * TWORDS, lane << 3, f0, f1);
+-                }
+-                else if constexpr (bits == 4)
+-                {
+-                    uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
+-                    exl3_gemv_ns::dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
+-                }
+-                else if constexpr (bits == 2)
+-                {
+-                    const uint32_t w = bw[t >> 1];
+-                    const int base = (t & 1) << 4;
+-                    uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
+-                    uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
+-                    exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+-                }
+-                else  // bits == 3
++                #pragma unroll
++                for (int f = 0; f < 2; ++f)
+                 {
+-                    uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
+-                    uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
+-                    exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
++                    acc0[t][f].x += __low2float(ch[t][f][0]);
++                    acc0[t][f].y += __high2float(ch[t][f][0]);
++                    ch[t][f][0] = hzero;
+                 }
++        }
++    };
+ 
+-                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+-                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+-            }
+-
+-            if ((d + 1) % FOLD == 0 || i + 1 == myn)
++    // Ring slot d: consume, refill with slice i + PF when it exists, run the slice
++    auto slot = [&] (int i, int d, bool steady, int fold)
++    {
++        const uint2 aw = ld_a(i);
++        if constexpr (EXL3_MOE_LATE)
++        {
++            // Decode straight from the ring slot, refill it after the slice (no register copy of the slot)
++            step(i, pf[d], aw, fold);
++            if (steady || i + PF < myn)
+             {
+                 #pragma unroll
+-                for (int t = 0; t < WNT; ++t)
+-                    #pragma unroll
+-                    for (int f = 0; f < 2; ++f)
+-                    {
+-                        acc0[t][f].x += __low2float(ch[t][f][0]);
+-                        acc0[t][f].y += __high2float(ch[t][f][0]);
+-                        ch[t][f][0] = hzero;
+-                    }
++                for (int l = 0; l < LOADS; ++l)
++                    pf[d][l] = ld_b(i + PF, l);
+             }
++            return;
++        }
++        uint32_t bw[LOADS];
++        #pragma unroll
++        for (int l = 0; l < LOADS; ++l)
++            bw[l] = pf[d][l];
++        if (steady || i + PF < myn)
++        {
++            #pragma unroll
++            for (int l = 0; l < LOADS; ++l)
++                pf[d][l] = ld_b(i + PF, l);
++        }
++        step(i, bw, aw, fold);
++    };
++
++    int ib = 0;
++    if constexpr (EXL3_MOE_STEADY)
++    {
++        // Full blocks whose refills all exist: no bounds checks, fold points known per ring slot (ib % PF == 0 and
++        // PF % FOLD == 0, and i + 1 < myn holds throughout)
++        for (; ib + 2 * PF <= myn; ib += PF)
++        {
++            #pragma unroll
++            for (int d = 0; d < PF; ++d)
++                slot(ib + d, d, true, (d + 1) % FOLD == 0 ? 1 : 0);
++        }
++    }
++    for (; ib < myn; ib += PF)
++    {
++        #pragma unroll
++        for (int d = 0; d < PF; ++d)
++        {
++            const int i = ib + d;
++            if (i >= myn) break;
++            slot(i, d, false, -1);
+         }
+     }
++    #undef XPK
+ 
+-    // Cross-warp reduction over the k splits. Lane l holds row l/4, cols
+-    // tile*16 + frag*8 + 2*(l%4) (+1)
++    // Cross-warp reduction over the k splits. Lane l holds row l/4, cols tile*16 + frag*8 + 2*(l%4) (+1); under TMMA
++    // col tile*16 + frag*8 + l/4, rows 2*(l%4) (+1)
++#if EXL3_MOE_TMMA_ON
++    {
++        const int rr = 2 * (lane & 3);
++        float* red = sh_red + wk * ROWS * TCOLS + wn * COLS + (lane >> 2);
++        #pragma unroll
++        for (int t = 0; t < WNT; ++t)
++            #pragma unroll
++            for (int f = 0; f < 2; ++f)
++            {
++                const int col = t * 16 + f * 8;
++                if (rr + 0 < nrows) red[(rr + 0) * TCOLS + col] = acc0[t][f].x;
++                if (rr + 1 < nrows) red[(rr + 1) * TCOLS + col] = acc0[t][f].y;
++            }
++    }
++#else
+     if (r0_ok)
+     {
+         const int c0 = 2 * (lane & 3);
+@@ -526,6 +695,7 @@ __device__ __forceinline__ void gemv_tile
+                 red[col + 1] = acc0[t][f].y;
+             }
+     }
++#endif
+     __syncthreads();
+ 
+     for (int o = threadIdx.x; o < TCOLS * nrows; o += THREADS)     // up to 128 x 8 outputs per block
+@@ -632,7 +802,7 @@ __device__ __forceinline__ void rotate_chunk(const MoeCoopParams& p, int row, co
+ // Rotation pre-kernel (bsz > 1): warp per (slot, chunk, projection) into had_g / had_u
+ 
+ #ifdef EXL3_MOE_COOP_DEFINE_ROT
+-__global__ __launch_bounds__(THREADS)
++__global__ MOE_COOP_BOUNDS
+ void exl3_moe_coop_rot_kernel(const MoeCoopParams p)
+ {
+     __shared__ int16_t sh_order[MAX_SLOTS];
+@@ -674,7 +844,7 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
+ // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
+ 
+ template <int bits, int cb, bool WIDE, bool HALF = false>
+-__global__ __launch_bounds__(THREADS)
++__global__ MOE_COOP_BOUNDS
+ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+ {
+     constexpr int TCOLS = tile_cols<WIDE>();
+@@ -810,7 +980,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+ // expert and stores the trimmed row
+ 
+ template <int bits, int cb, bool WIDE, bool HALF = false>
+-__global__ __launch_bounds__(THREADS)
++__global__ MOE_COOP_BOUNDS
+ void exl3_moe_coop_b_kernel(const MoeCoopParams p)
+ {
+     constexpr int TCOLS = tile_cols<WIDE>();
+diff --git a/tests/kernels/moe/test_moe_coop.py b/tests/kernels/moe/test_moe_coop.py
+index f7b56afa..d6fda4b1 100644
+--- a/tests/kernels/moe/test_moe_coop.py
++++ b/tests/kernels/moe/test_moe_coop.py
+@@ -199,6 +199,22 @@ def test_odd_shapes(device):
+     run_case(device, 17, 6, 6, 6, 2, H = 384, Hi = 384, I = 1152, Ho = 384, H_out = 384)
+ 
+ 
++@pytest.mark.parametrize("K", [1.5, 2.5, 3.5])
++def test_half_rates(device, K):
++    # half-integer rates (mul1 only): the staged tile, or the register tile under EXL3_MOE_HALF_REG
++    run_case(device, int(K * 10) + 40, K, K, K, 2)
++    run_case(device, int(K * 10) + 41, K, K, K, 2, bsz = 1, shared = "gated")
++
++
++@pytest.mark.parametrize("K", [3, 3.5])
++@pytest.mark.parametrize("bsz", [1, 2, 3, 4, 5, 6, 7, 8])
++def test_qwen38_shape(device, K, bsz):
++    # Qwen3.8-Flash-Next decode shape: H 2560, expert interm 640, top-10 of 48 experts here, gated shared expert, at
++    # every decode width the verify window uses (1-8 rows), K 3 (layers 4-43) and 3.5 (layers 0-3, 44-47)
++    run_case(device, 50 + bsz, K, K, K, 2, H = 2560, Hi = 2560, I = 640, Ho = 2560, H_out = 2560, E = 48, topk = 10,
++             bsz = bsz, shared = "gated")
++
++
+ def _device_still_works(device):
+     # A launch error left pending by the call would surface in the next unrelated launch
+     y = torch.ones(4, device = device) * 2
+-- 
+2.43.0
+

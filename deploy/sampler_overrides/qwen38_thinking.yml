@@ -1,0 +1,16 @@
+# Fallbacks only (force: false): clients that sample deliberately keep their values.
+temperature:
+  override: 0.6
+  force: false
+
+top_k:
+  override: 20
+  force: false
+
+top_p:
+  override: 0.95
+  force: false
+
+min_p:
+  override: 0.0
+  force: false

@@ -1,0 +1,40 @@
+# TabbyAPI config for Qwen3.8-Flash-Next EXL3 3.18bpw_h6_ng8 on one 96 GiB RTX PRO 6000.
+# Set model_dir / draft_model_dir to where you keep the weights. The GPU is chosen in deploy/launch.sh (GPU=).
+network:
+  host: 127.0.0.1
+  port: 5000
+  disable_auth: false
+  api_servers: ["OAI"]
+  web_ui: false
+
+logging:
+  log_live_status: false
+  log_timestamps: true
+
+model:
+  model_dir: /path/to/models
+  model_name: Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8
+  backend: exllamav3
+  max_seq_len: 1048576        # 1M per request (YaRN factor 4, deploy/model-config-yarn4.patch)
+  cache_size: 3121152         # largest 6,6 pool that keeps >= 1.5 GiB free at peak on a 96 GiB card
+  cache_mode: '6,6'
+  tensor_parallel: false
+  gpu_split_auto: false
+  gpu_split: [99]
+  max_batch_size: 8
+  chunk_size: 2048
+  ngram_ram: false            # engram table read from disk; EXL3_NGRAM_LOCK=1 pins it in RAM instead
+  vision: true
+  vision_offload: false
+  warmup: true
+
+draft_model:
+  draft_mode: model
+  draft_model_dir: /path/to/drafts
+  draft_model_name: Qwen3.8-Flash-Next-DFlash2
+  draft_num_tokens: 7         # DFlash2 block 8 -> 7 drafts; 8 drafts leave the MAX_BSZN=8 fused path
+  dynamic_draft: true
+  draft_confidence: 0.45
+
+sampling:
+  override_preset: qwen38_thinking

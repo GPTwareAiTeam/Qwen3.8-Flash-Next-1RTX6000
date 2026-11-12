@@ -1,0 +1,350 @@
+From 54be8d0bafa2bcb73729a4fed53806fa162df104 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:23:40 -0500
+Subject: [PATCH 4/7] MoE coop: wide rows on speculative-verify forwards
+ (EXL3_MOE_COOP_ROWS)
+
+EXL3_MOE_COOP_ROWS (8..64, default 8) routes verify windows up to that width through the coop kernels. Prompt prefill keeps the fused tier, so single-request output is independent of the setting. c8 +20 % at 64.
+---
+ .../libtorch/blocksparse_mlp.cpp              | 29 +++---
+ .../exllamav3_ext/quant/exl3_moe_coop.cu      |  2 +-
+ .../quant/exl3_moe_coop_kernel.cuh            | 90 ++++++++++---------
+ exllamav3/modules/block_sparse_mlp.py         | 24 +++--
+ tests/kernels/moe/test_moe_coop.py            | 20 +++--
+ 5 files changed, 102 insertions(+), 63 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
+index a14888fd..9daef29e 100644
+--- a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
+@@ -81,7 +81,8 @@ void BC_BlockSparseMLP::run_bszN
+     // (out-of-range picks contribute exact zeros to the partial sum) handled inside. Nothing is
+     // captured or patched: routing tensors are read directly, so no per-bsz statics or graphs
+     int num_tokens = (int) y.size(0);
+-    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN: bsz out of supported range");
++    // Rows: up to the routed sum's capacity (EXL3_MOE_COOP_ROWS in block_sparse_mlp.py, 8 by default)
++    TORCH_CHECK(num_tokens >= 1 && num_tokens <= out_bszn.size(0), "run_bszN: bsz out of supported range");
+ 
+     c10::cuda::CUDAGuard device_guard(y.device());
+ 
+@@ -102,9 +103,15 @@ void BC_BlockSparseMLP::run_bszN
+     }
+     else if (shared_experts)
+     {
+-        at::Tensor x_dense = y.unsqueeze(0);
++        // The shared expert's multi-row graph covers MAX_BSZN rows: wider verify windows run it in pieces
++        for (int start = 0; start < num_tokens; start += MAX_BSZN)
++        {
++            const int end = std::min(start + MAX_BSZN, num_tokens);
++            at::Tensor x_dense = y.slice(0, start, end).unsqueeze(0);
++            at::Tensor out_piece = out_d_sh.value().slice(1, start, end);
++            shared_experts->run_bszN(x_dense, out_piece);
++        }
+         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
+-        shared_experts->run_bszN(x_dense, out_d_sh_n);
+         sh_o = out_d_sh_n;
+     }
+     exl3_moe_coop_run(coop_p, coop_K_gu, coop_K_d, coop_cb, y, selected_experts, routing_weights, sh_o);
+@@ -397,11 +404,13 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
+             if (d->bias) db = table(d->bias.value());
+             auto hopt = at::TensorOptions().dtype(at::kHalf).device(dev);
+             auto gopt = at::TensorOptions().dtype(interm_g.scalar_type()).device(dev);
+-            at::Tensor had_g_sh = at::empty({MAX_BSZN, Hi_sh}, hopt), had_u_sh = at::empty({MAX_BSZN, Hi_sh}, hopt);
+-            at::Tensor gu_g_sh = at::empty({MAX_BSZN, I_sh}, gopt), gu_u_sh = at::empty({MAX_BSZN, I_sh}, gopt);
+-            at::Tensor act_out_sh = at::empty({MAX_BSZN, I_sh}, hopt);
+-            at::Tensor d_out_sh = at::empty({MAX_BSZN, Ho_sh}, at::TensorOptions().dtype(at::kFloat).device(dev));
+-            at::Tensor ctr_sh = at::zeros({exl3_moe_coop_ctr_len(MAX_BSZN, MAX_BSZN, I_sh, Ho_sh)}, at::TensorOptions().dtype(at::kInt).device(dev));
++            // Sized by the shared output's rows (the routed sum's capacity, EXL3_MOE_COOP_ROWS)
++            const int shared_rows = (int) out_d_sh->size(1);
++            at::Tensor had_g_sh = at::empty({shared_rows, Hi_sh}, hopt), had_u_sh = at::empty({shared_rows, Hi_sh}, hopt);
++            at::Tensor gu_g_sh = at::empty({shared_rows, I_sh}, gopt), gu_u_sh = at::empty({shared_rows, I_sh}, gopt);
++            at::Tensor act_out_sh = at::empty({shared_rows, I_sh}, hopt);
++            at::Tensor d_out_sh = at::empty({shared_rows, Ho_sh}, at::TensorOptions().dtype(at::kFloat).device(dev));
++            at::Tensor ctr_sh = at::zeros({exl3_moe_coop_ctr_len(shared_rows, shared_rows, I_sh, Ho_sh)}, at::TensorOptions().dtype(at::kInt).device(dev));
+             int act_sh = se->act_gelu ? MOE_COOP_ACT_GELU : se->act_relu2 ? MOE_COOP_ACT_RELU2 : MOE_COOP_ACT_SILU;
+             sh_coop_p = exl3_moe_coop_prepare
+             (
+@@ -416,8 +425,8 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
+             if (gb) sh_tables.push_back(gb.value());
+             if (ub) sh_tables.push_back(ub.value());
+             if (db) sh_tables.push_back(db.value());
+-            sh_sel = at::zeros({MAX_BSZN, 1}, lopt.device(dev));
+-            sh_rw = at::ones({MAX_BSZN, 1}, hopt);
++            sh_sel = at::zeros({shared_rows, 1}, lopt.device(dev));
++            sh_rw = at::ones({shared_rows, 1}, hopt);
+             sh_coop = true;
+         }
+     }
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+index b343ae2b..8e7fa97e 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+@@ -241,7 +241,7 @@ MoeCoopParams exl3_moe_coop_prepare
+     check_scratch(act_out, p.I);
+     check_scratch(d_out, p.Ho);
+     TORCH_CHECK(out.dim() >= 2 && out.stride(-1) == 1, "exl3_moe_coop: out shape");
+-    TORCH_CHECK(slots_max >= 1 && slots_max <= 256, "exl3_moe_coop: scratch must hold 1..256 slots");
++    TORCH_CHECK(slots_max >= 1 && slots_max <= 768, "exl3_moe_coop: scratch must hold 1..768 slots");
+ 
+     // Counters: the gate/up stage's block covers every slot the scratch can hold, the down
+     // stage's every token row the output can hold
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+index d2134efc..c36f864b 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+@@ -43,7 +43,7 @@ template <bool WIDE> constexpr int tile_wk() { return WK / tile_wn<WIDE>(); }  /
+ template <bool WIDE> constexpr int tile_cols() { return tile_wn<WIDE>() * COLS; }
+ template <bool WIDE> constexpr int tile_gpc() { return tile_cols<WIDE>() >= 128 ? 1 : 128 / tile_cols<WIDE>(); }  // block groups per 128-chunk
+ template <bool WIDE> constexpr int tile_cpb() { return tile_cols<WIDE>() >= 128 ? tile_cols<WIDE>() / 128 : 1; }  // 128-chunks per block
+-constexpr int MAX_SLOTS = 256;                  // MAX_BSZN * top_k bound (top_k <= 32)
++constexpr int MAX_SLOTS = 768;                  // verify rows x top_k bound: 64 rows x top-10 + headroom (int16 slot ids)
+ constexpr int STAGE_WORDS = WNT * 8 * 8;        // words per warp per k-slice at 8 bpw
+ constexpr float R_SCALE = 0.088388347648f;      // 1/sqrt(128)
+ 
+@@ -247,69 +247,77 @@ __device__ __forceinline__ void build_runs
+     int* run_start = p.runs + 2;
+     int* order = p.runs + 2 + p.slots_max + 1;
+ 
+-    // Routing of every slot: local expert or -1 when inactive
+-    if (t < slots)
++    // Routing of every slot: local expert or -1 when inactive (slots may exceed the block size: verify windows of
++    // up to COOP_ROWS rows x top-k)
++    for (int s = t; s < slots; s += THREADS)
+     {
+-        const SlotInfo si = slot_info(p, t);
+-        sh_local[t] = si.active ? (int16_t) si.local : (int16_t) -1;
++        const SlotInfo si = slot_info(p, s);
++        sh_local[s] = si.active ? (int16_t) si.local : (int16_t) -1;
+     }
+-    if (t == 0) sh_res[0] = 0;
++    if (t == 0) { sh_res[0] = 0; sh_res[1] = 0; }
+     __syncthreads();
+ 
+     // Rank of every active slot by (expert, slot)
+-    const int my_e = t < slots ? sh_local[t] : -1;
+-    if (my_e >= 0)
++    for (int s = t; s < slots; s += THREADS)
+     {
+-        const int key = (my_e << 8) | t;
++        const int my_e = sh_local[s];
++        if (my_e < 0) continue;
+         int rank = 0;
+         for (int u = 0; u < slots; ++u)
+         {
+             const int eu = sh_local[u];
+-            rank += (eu >= 0 && ((eu << 8) | u) < key) ? 1 : 0;
++            rank += (eu >= 0 && (eu < my_e || (eu == my_e && u < s))) ? 1 : 0;
+         }
+-        sh_order[rank] = (int16_t) t;
++        sh_order[rank] = (int16_t) s;
+         atomicMax(sh_res, rank + 1);     // active slot count
+     }
+     __syncthreads();
+     const int n_active = sh_res[0];
+ 
+     // Run starts: a new expert, or ROWS slots into the same expert (first index of an expert =
+-    // number of active slots with a smaller expert)
+-    int is_start = 0;
+-    if (t < n_active)
++    // number of active slots with a smaller expert). Exclusive prefix count of run starts in block-sized tiles
++    // (warp scan + warp totals), each tile continuing the previous tile's run count (sh_res[1])
++    for (int tile = 0; tile < n_active; tile += THREADS)
+     {
+-        const int e_t = sh_local[sh_order[t]];
+-        int first = 0;
+-        for (int u = 0; u < slots; ++u)
++        const int s = tile + t;
++        int is_start = 0;
++        if (s < n_active)
+         {
+-            const int eu = sh_local[u];
+-            first += (eu >= 0 && eu < e_t) ? 1 : 0;
++            const int e_s = sh_local[sh_order[s]];
++            int first = 0;
++            for (int u = 0; u < slots; ++u)
++            {
++                const int eu = sh_local[u];
++                first += (eu >= 0 && eu < e_s) ? 1 : 0;
++            }
++            is_start = (s == 0 || sh_local[sh_order[s - 1]] != e_s || (s - first) % ROWS == 0) ? 1 : 0;
++            order[s] = sh_order[s];
+         }
+-        is_start = (t == 0 || sh_local[sh_order[t - 1]] != e_t || (t - first) % ROWS == 0) ? 1 : 0;
+-        order[t] = sh_order[t];
+-    }
+-    // Exclusive prefix count of run starts over the block (warp scan + warp totals)
+-    int v = is_start;
+-    #pragma unroll
+-    for (int o = 1; o < 32; o <<= 1)
+-    {
+-        int n = __shfl_up_sync(0xffffffffu, v, o);
+-        if (lane >= o) v += n;
+-    }
+-    if (lane == 31) sh_scan[warp] = v;
+-    __syncthreads();
+-    int base = 0, total_runs = 0;
+-    for (int w = 0; w < WK; ++w)
+-    {
+-        if (w < warp) base += sh_scan[w];
+-        total_runs += sh_scan[w];
++        int v = is_start;
++        #pragma unroll
++        for (int o = 1; o < 32; o <<= 1)
++        {
++            int n = __shfl_up_sync(0xffffffffu, v, o);
++            if (lane >= o) v += n;
++        }
++        if (lane == 31) sh_scan[warp] = v;
++        __syncthreads();
++        int base = 0, total = 0;
++        for (int w = 0; w < WK; ++w)
++        {
++            if (w < warp) base += sh_scan[w];
++            total += sh_scan[w];
++        }
++        const int prior = sh_res[1];
++        if (is_start) run_start[prior + base + v - 1] = s;
++        __syncthreads();
++        if (t == 0) sh_res[1] = prior + total;
++        __syncthreads();
+     }
+-    const int run_id = base + v - is_start;
+-    if (is_start) run_start[run_id] = t;
+     if (t == 0)
+     {
+-        run_start[total_runs] = n_active;
+-        p.runs[0] = total_runs;
++        run_start[sh_res[1]] = n_active;
++        p.runs[0] = sh_res[1];
+     }
+ }
+ 
+diff --git a/exllamav3/modules/block_sparse_mlp.py b/exllamav3/modules/block_sparse_mlp.py
+index ecc42ca7..a66250ed 100644
+--- a/exllamav3/modules/block_sparse_mlp.py
++++ b/exllamav3/modules/block_sparse_mlp.py
+@@ -48,6 +48,12 @@ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
+ # (num_tokens <= fused_rows, single-tile launch); EXL3_MOE_NO_READBACK=0 restores the readback for A/B
+ MOE_NO_READBACK = os.environ.get("EXL3_MOE_NO_READBACK", "1") != "0"
+ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
++# Rows the fused decode kernels (BC_BlockSparseMLP.run_bszN, exl3_moe_coop) take: multi-user verify windows of up to
++# COOP_ROWS rows run as one coop launch pair instead of the prefill-shaped fused tier (exl3_moe + expert sort).
++# Scratch grows with it (COOP_ROWS x top_k slots, <= 768). Default 8 = the MAX_BSZN decode width
++COOP_ROWS = int(os.environ.get("EXL3_MOE_COOP_ROWS", str(MAX_BSZN)))
++if not MAX_BSZN <= COOP_ROWS <= 64:
++    raise ValueError("EXL3_MOE_COOP_ROWS must be between 8 and 64")
+ 
+ @dataclass
+ class FusedBuffers:
+@@ -577,12 +583,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+         I = self.intermediate_size_padded
+         device = self.device
+ 
+-        # bszn_rows bounds the fused bsz 1..MAX_BSZN path (BC_BlockSparseMLP.run_bszN, one
++        # bszn_rows bounds the fused bsz 1..COOP_ROWS path (BC_BlockSparseMLP.run_bszN, one
+         # slot per (token, expert) pick); buffers grow to whichever of that or the single-expert
+         # graph loop's TEMP_ROWS_GRAPH requirement is larger, sharing the one cache entry per name
+         # (g_tensor_cache is exact-shape-keyed and never evicts -- growing a differently-shaped
+         # second entry under the same name would silently double memory forever)
+-        bszn_rows = MAX_BSZN * numex
++        bszn_rows = COOP_ROWS * numex
++        if bszn_rows > 768:
++            raise ValueError(f"EXL3_MOE_COOP_ROWS {COOP_ROWS} x top-{numex} exceeds the coop kernel's 768 slots")
+ 
+         temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
+         temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
+@@ -602,7 +610,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+         # Completion counters + expert-run table of the fused decode kernels
+         # (BC_BlockSparseMLP.run_bszN): the kernels reset each other's counters for the next
+         # call, so they only need zeroing once
+-        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
++        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + COOP_ROWS * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
+         coop_ctr.zero_()
+         # Rotated up-projection input per slot for the fused kernels at bsz > 1 (yh holds the gate's)
+         had_u = g_tensor_cache.get(device, (bszn_rows, Hi), torch.half, "moe1_temp_hidden_u")
+@@ -614,7 +622,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+ 
+         # Routed sum of the fused decode path, one exact-width row per token (the kernel trims the
+         # padded down width on the way out)
+-        out_bszn = g_tensor_cache.get(device, (MAX_BSZN, H), torch.float, "moe1_out_bszn")
++        out_bszn = g_tensor_cache.get(device, (COOP_ROWS, H), torch.float, "moe1_out_bszn")
+ 
+         cfg = ExpertsCFG(
+             yh = yh,
+@@ -647,7 +655,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+             ):
+                 self.bc_sh_exp = True
+                 sh_exp_bc = self.shared_experts.bc
+-                sh_exp_t = torch.empty((1, MAX_BSZN, self.hidden_size), dtype = torch.float, device = self.device)
++                sh_exp_t = torch.empty((1, COOP_ROWS, self.hidden_size), dtype = torch.float, device = self.device)
+                 if self.shared_gate:
+                     assert self.shared_gate.quant_type == "fp16"
+                     sh_gate_bc = self.shared_gate.inner.bc
+@@ -1038,7 +1046,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
+         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
+         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
+-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
++        # Wider calls (MAX_BSZN < rows <= COOP_ROWS) take the coop kernels only on speculative verify forwards
++        # (recurrent_history: multi-user verify windows), never on prompt prefill: chunks of a single sequence keep the
++        # fused tier, so single-user output does not depend on COOP_ROWS
++        bszn_eligible = self.bc is not None and (
++            bsz <= MAX_BSZN or (bsz <= COOP_ROWS and bool(params.get("recurrent_history"))))
+ 
+         # Routing
+         if self.router_pre_norm:
+diff --git a/tests/kernels/moe/test_moe_coop.py b/tests/kernels/moe/test_moe_coop.py
+index d6fda4b1..608de32e 100644
+--- a/tests/kernels/moe/test_moe_coop.py
++++ b/tests/kernels/moe/test_moe_coop.py
+@@ -83,14 +83,15 @@ def run_case(device, seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = Fa
+     # Kernel. Scratch sized for 4x the slots (as the module does for MAX_BSZN rows) so the
+     # launcher can use split-k partial rows
+     slots = bsz * topk
+-    smax = 4 * slots
++    smax = min(4 * slots, 768)       # the kernel's slot cap (64 verify rows x top-10 + headroom)
++    rows_cap = max(8, bsz)
+     gu_dt = torch.float if gu_f32 else torch.half
+     gu_g = torch.empty((smax, 1, I), dtype = gu_dt, device = device)
+     gu_u = torch.empty((smax, 1, I), dtype = gu_dt, device = device)
+     act_out = torch.empty((smax, 1, I), dtype = torch.half, device = device)
+     d_out = torch.empty((smax, 1, Ho), dtype = torch.float, device = device)
+-    out = torch.full((8, H_out), float("nan"), dtype = torch.float, device = device)
+-    ctr = torch.zeros((smax * (I // 128) + 8 * (Ho // 128) + 2 * smax + 3,), dtype = torch.int, device = device)
++    out = torch.full((rows_cap, H_out), float("nan"), dtype = torch.float, device = device)
++    ctr = torch.zeros((smax * (I // 128) + rows_cap * (Ho // 128) + 2 * smax + 3,), dtype = torch.int, device = device)
+     had_g = torch.empty((slots, Hi), dtype = torch.half, device = device); had_u = torch.empty_like(had_g)
+     gtabs = gate.tabs if gated else up.tabs
+     gK = gate.K if gated else up.K
+@@ -180,6 +181,14 @@ def test_fp32_gate_up_scratch(device):
+     run_case(device, 12, 4, 4, 4, 1, gu_f32 = True)
+ 
+ 
++def test_wide_duplicates(device):
++    # 64 rows over 12 experts at top-10: ~53 slots per expert, i.e. many ROWS-sized runs per expert, and 640 active
++    # slots ranked and scanned across two 512-thread tiles
++    run_case(device, 61, 3, 3, 3, 2, H = 512, Hi = 512, I = 256, Ho = 512, H_out = 512, E = 12, topk = 10, bsz = 64)
++    run_case(device, 62, 3.5, 3.5, 3.5, 2, H = 512, Hi = 512, I = 256, Ho = 512, H_out = 512, E = 12, topk = 10, bsz = 48,
++             shared = "gated")
++
++
+ def test_duplicate_experts(device):
+     # few experts, many slots: runs of up to ROWS slots share one expert's weights
+     run_case(device, 19, 4, 4, 4, 1, E = 3, topk = 3, bsz = 8)
+@@ -207,10 +216,11 @@ def test_half_rates(device, K):
+ 
+ 
+ @pytest.mark.parametrize("K", [3, 3.5])
+-@pytest.mark.parametrize("bsz", [1, 2, 3, 4, 5, 6, 7, 8])
++@pytest.mark.parametrize("bsz", [1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 25, 26, 32, 48, 64])
+ def test_qwen38_shape(device, K, bsz):
+     # Qwen3.8-Flash-Next decode shape: H 2560, expert interm 640, top-10 of 48 experts here, gated shared expert, at
+-    # every decode width the verify window uses (1-8 rows), K 3 (layers 4-43) and 3.5 (layers 0-3, 44-47)
++    # every decode width the verify window uses (1-8 rows) and the multi-user verify widths EXL3_MOE_COOP_ROWS admits
++    # (up to 64 rows = 640 slots: run table past one 512-thread tile), K 3 (layers 4-43) and 3.5 (layers 0-3, 44-47)
+     run_case(device, 50 + bsz, K, K, K, 2, H = 2560, Hi = 2560, I = 640, Ho = 2560, H_out = 2560, E = 48, topk = 10,
+              bsz = bsz, shared = "gated")
+ 
+-- 
+2.43.0
+
