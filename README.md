@@ -1,6 +1,8 @@
 # Qwen3.8-Flash-Next on one RTX PRO 6000 — V2
 
-Serving recipe for `Qwen/Qwen3.8-Flash-Next` (EXL3 `3.18bpw_h6_ng8`) on a single 96 GiB RTX PRO 6000 Blackwell
+Serving recipe for `Qwen/Qwen3.8-Flash-Next` in EXL3 `3.18bpw_h6_ng8`
+([turboderp/Qwen3.8-Flash-Next-exl3, branch 3.18bpw_h6_ng8](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/3.18bpw_h6_ng8))
+on a single 96 GiB RTX PRO 6000 Blackwell
 (SM120), with TabbyAPI, a patched exllamav3, the DFlash2 drafter, a 3M-token KV pool and up to 640k tokens per
 request.
 
@@ -54,7 +56,9 @@ distributions at short context; at long context KL is 0.0019 mean / 0.0053 max (
 - One RTX PRO 6000 Blackwell (96 GiB). Measured on the Max-Q (300 W) edition.
 - 50 GiB of lockable host RAM for the engram table (memlock ≥ 50 GiB; `launch.sh` checks it), or stream the table
   from a fast NVMe instead (see below).
-- The model, about 100 GiB on disk, half of it the engram (n-gram embedding) table.
+- The model: [`turboderp/Qwen3.8-Flash-Next-exl3`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/3.18bpw_h6_ng8),
+  branch `3.18bpw_h6_ng8` (measured at revision `2bfc9dade6be0b5b42e2b381d7a6cc160c1d409c`). About 100 GiB on disk,
+  half of it the engram (n-gram embedding) table.
 - Python 3.12, PyTorch 2.11 with CUDA 13 (`cu130` wheels), flash-linear-attention 0.6.0, the CUDA toolkit
   (`nvcc`, for the extension's JIT build) and `ninja`. Use an environment without a pip-installed exllamav3: its
   prebuilt extension would shadow the patched build (`launch.sh` refuses to start in that case).
@@ -80,8 +84,13 @@ git checkout 564f8fb && git apply /path/to/repo/deploy/tabbyapi-prefill-chunk-si
 pip install .
 cp /path/to/repo/deploy/sampler_overrides/qwen38_thinking.yml sampler_overrides/ && cd ..
 
+# model and drafter
+hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 3.18bpw_h6_ng8 \
+  --local-dir /path/to/models/Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8
+hf download incoai/Qwen3.8-Flash-Next-DFlash2 --local-dir /path/to/drafts/Qwen3.8-Flash-Next-DFlash2
+
 # long context (needed for the 640k limit): apply the YaRN factor-4 change to the model's config.json
-cd /path/to/models/Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8 && patch -p1 < /path/to/repo/deploy/model-config-yarn4.patch
+(cd /path/to/models/Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8 && patch -p1 < /path/to/repo/deploy/model-config-yarn4.patch)
 
 # edit deploy/config.yml: model_dir, draft_model_dir, network.port, auth; then
 ulimit -l 52428800      # memlock for the engram lock (or LimitMEMLOCK=52428800K in a systemd unit)
