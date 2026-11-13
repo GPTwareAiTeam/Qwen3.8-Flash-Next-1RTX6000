@@ -15,14 +15,14 @@ model:
   model_dir: /path/to/models
   model_name: Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8
   backend: exllamav3
-  max_seq_len: 1048576        # 1M per request (YaRN factor 4, deploy/model-config-yarn4.patch)
-  cache_size: 3121152         # largest 6,6 pool that keeps >= 1.5 GiB free at peak on a 96 GiB card
+  max_seq_len: 655360         # 640k per request (model supports 1M with deploy/model-config-yarn4.patch)
+  cache_size: 2999808         # 3M (multiple of 256); with 8192-token chunks keeps ~1.9 GiB free at peak
   cache_mode: '6,6'
   tensor_parallel: false
   gpu_split_auto: false
   gpu_split: [99]
   max_batch_size: 8
-  chunk_size: 2048
+  chunk_size: 8192            # 16384 runs out of memory at this pool
   ngram_ram: false            # engram table read from disk; EXL3_NGRAM_LOCK=1 pins it in RAM instead
   vision: true
   vision_offload: false

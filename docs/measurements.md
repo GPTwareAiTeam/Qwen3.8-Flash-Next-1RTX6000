@@ -22,7 +22,7 @@ short natural prompt.
 |---|---|---|---|---|
 |8,8|16.5|2,573,312|22/24|-|
 |8,6|15.0|2,833,920|21/24|0.0013|
-|6,6|13.5|3,142,656 → 3,121,152 with the final engine|21-22/24|0.0065|
+|6,6|13.5|3,142,656 → 3,121,152 with the final engine (2048-token chunks); shipped: 2,999,808 with 8192-token chunks|21-22/24|0.0065|
 |8,4|13.5|2,883,584|20/24, `2+2=` → 5|rejected|
 
 ## Per-change A/B (each against the step before)
@@ -54,24 +54,27 @@ short natural prompt.
 Cold prompts (a unique prefix per request, so no prefix-cache hits), one generated token, wall time from request to
 response.
 
-|prompt|v1|V2|
+|prompt|v1 (2048-token chunks)|V2, 2048-token chunks, 3.12M pool|V2 shipped, 8192-token chunks, 3M pool|
+|---|---|---|---|
+|~2k tokens, prose / code / chat / math|3,044-3,268 t/s|3,453-3,507 t/s|3,475 t/s|
+|32k|-|4,200-4,262 t/s|5,690 t/s (5.8 s)|
+|128k|-|4,146-4,240 t/s|5,647 t/s (23.2 s)|
+|520k (needle)|130.2 s, ~3,990 t/s|129.8-132.0 s, ~3,940-3,990 t/s|98.3 s, 5,294 t/s, found|
+|cold 32k, slowest of 5|16.5 s|8.65 s (engram lock)|-|
+
+The v1 and 2048-chunk V2 columns come from different sessions; at 520k they agree. The shipped column is one boot
+(two runs per prompt, median), measured right after an 8-user run.
+
+Chunk-size experiments:
+
+|chunking|pool|result|
 |---|---|---|
-|~2k tokens, prose / code / chat / math|3,044-3,268 t/s|3,453-3,507 t/s|
-|32k|-|4,200-4,260 t/s|
-|128k|-|4,146-4,240 t/s|
-|520k (needle)|130.2 s, ~3,990 t/s|129.8-132.0 s, ~3,940-3,990 t/s|
-|cold 32k, slowest of 5|16.5 s|8.65 s (engram lock)|
-
-The 2k rows come from different sessions; the 520k row is the cleanest comparison and shows no change. Both
-recipes prefill in 2048-token chunks.
-
-Chunk-size experiments at the largest KV pool:
-
-|chunking|result|
-|---|---|
-|`chunk_size: 8192`|+39-40 % cold prefill at 32k and 128k; peak free VRAM 649 MiB (below the 1.5 GiB floor), would need ~70k fewer KV tokens|
-|`chunk_size: 16384`|does not boot (the loader sizes its memory check by the chunk)|
-|adaptive chunks (patch 0006, `EXL3_PREFILL_ADAPTIVE=1`, `prefill_chunk_size: 16384`)|fresh server: 4,820 / 4,853 t/s at 32k / 128k; after decode traffic chunks shrink back to ~2,000-2,300 rows: +3.4-3.7 % at 128k, long-context KL 0.0128|
+|`chunk_size: 8192`|3,137,536|+39-40 % cold prefill at 32k and 128k; peak free VRAM 649 MiB, below the 1.5 GiB floor|
+|`chunk_size: 8192` (shipped)|2,999,808, `max_seq_len` 655,360|+33 % at 32k, +36 % at 128k, 520k 131 → 98 s; peak free 1,953 MiB; c1 305.3 / c8 668.8 t/s; greedy identity 8/8 text and tokens, KL short 0 / long 0.0019 mean, 0.0053 max vs 2048-token chunks|
+|`chunk_size: 16384`|3,121,152|does not boot (the loader sizes its memory check by the chunk)|
+|`chunk_size: 16384`|2,999,808|boots, then runs out of GPU memory on a cold 32k prefill (641 MiB free)|
+|adaptive chunks (patch 0006, `EXL3_PREFILL_ADAPTIVE=1`, `prefill_chunk_size: 16384`)|3,121,152|fresh server: 4,820 / 4,853 t/s at 32k / 128k; after decode traffic chunks shrink back to ~2,000-2,300 rows: +3.4-3.7 % at 128k, long-context KL 0.0128|
 
 `deploy/tabbyapi-prefill-chunk-size.patch` adds the separate `prefill_chunk_size` setting that adaptive chunks need.
-To trade KV for prefill speed instead, lower `cache_size` by ~70k tokens and set `chunk_size: 8192`.
+To favor context over prefill speed instead, set `chunk_size: 2048` and raise `cache_size` to 3,121,152 and
+`max_seq_len` to 1,048,576.
