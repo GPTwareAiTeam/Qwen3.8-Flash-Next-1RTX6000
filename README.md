@@ -1,7 +1,8 @@
 # Qwen3.8-Flash-Next on one RTX PRO 6000 — V2
 
 Serving recipe for `Qwen/Qwen3.8-Flash-Next` (EXL3 `3.18bpw_h6_ng8`) on a single 96 GiB RTX PRO 6000 Blackwell
-(SM120), with TabbyAPI, a patched exllamav3, the DFlash2 drafter and a 1M-token context.
+(SM120), with TabbyAPI, a patched exllamav3, the DFlash2 drafter, a 3M-token KV pool and up to 640k tokens per
+request.
 
 This is V2. It improves on the original v1 recipe (stock exllamav3 1.6.4, 8-bit KV), the baseline in the tables below.
 
@@ -11,10 +12,14 @@ This is V2. It improves on the original v1 recipe (stock exllamav3 1.6.4, 8-bit 
 |2|240.1|**398.0**|+65.8 %|
 |4|344.5|**560.9**|+62.8 %|
 |8|453.7|**676.7**|+49.1 %|
-|KV cache|2,555,904 tokens|**3,121,152 tokens**|+22.1 %|
+|KV cache (shared pool)|2,555,904 tokens|**2,999,808 tokens**|+17.4 %|
+|Max per request|1,048,576|655,360|up to 8 requests share the pool|
 
 v1: stock exllamav3 1.6.4 with 8-bit KV and the same model, drafter and TabbyAPI. Both measured on the same
 card, alternating A, A, B, B server boots, three runs per boot, medians; 512 generated tokens per request, greedy.
+The user rows were measured with V2 at a 3,121,152-token pool and 2048-token prefill chunks; the shipped config
+(3M pool, 8192-token chunks) measured 305.3 t/s at 1 user and 668.8 t/s at 8 users in a single run, the same within
+noise.
 
 |Decode, 2048 forced tokens from a short prompt|v1, greedy|V2, greedy|Change|V2, `qwen38_thinking` preset|
 |---|---|---|---|---|
@@ -27,21 +32,22 @@ Greedy shown for comparison; the shipped qwen38_thinking preset (Qwen's recommen
 slower because sampled tokens accept fewer drafts. The preset column samples at temperature 0.6, top-k 20, top-p 0.95
 (`bench/decode_natural.py` with `SAMPLING=preset`, one run of three repeats).
 
-|Prefill, cold prompt → 1 token|v1|V2|V2 time to first token|
+|Prefill, cold prompt → 1 token|v1 (2048-token chunks)|V2 (8192-token chunks)|V2 time to first token|
 |---|---|---|---|
-|~2k tokens|3,044-3,268 t/s|3,453-3,507 t/s|0.6-0.8 s|
-|32k|-|4,200-4,260 t/s|7.3-7.5 s|
-|128k|-|4,146-4,240 t/s|~30 s|
-|520k|3,990 t/s (130.2 s)|3,940-3,990 t/s|130-132 s|
-|worst of 5 cold 32k requests|16.5 s (stall)|8.65 s||
+|~2k tokens|3,044-3,268 t/s|3,475 t/s|0.6 s|
+|32k|-|**5,690 t/s**|5.8 s|
+|128k|-|**5,647 t/s**|23 s|
+|520k|3,990 t/s (130.2 s)|**5,294 t/s (98.3 s)**|98 s|
+|worst of 5 cold 32k requests|16.5 s (stall)|8.65 s (measured with 2048 chunks)||
 
-Prefill throughput is unchanged: V2's patches target decode, and both use 2048-token chunks (the 2k gap comes from
-separate sessions, not an A/B). What V2 improves is the worst case: with the engram table locked in RAM, a cold
-first request no longer stalls on disk reads. Larger chunks would help long prompts (chunk 8192: +39-40 % at 32k and
-128k) but do not fit next to the full KV pool; see `docs/measurements.md`.
+Long prompts prefill 33-36 % faster than with 2048-token chunks (32k: 4,262 → 5,690 t/s; 128k: 4,146 → 5,647 t/s;
+520k: 131 → 98 s). The larger chunks fit because the pool is 3M tokens instead of 3.12M. With the engram table locked
+in RAM, a cold first request also no longer stalls on disk reads.
 
-Quality: 22/24 on the exact-answer probe (`bench/accuracy.py`, v1 22/24); a planted fact 520k tokens deep is
-retrieved; 1.6 GiB of VRAM stays free at peak.
+Quality: 22/24 on the exact-answer probe (`bench/accuracy.py`, v1 22/24; measured with 2048-token chunks); a planted
+fact 520k tokens deep is retrieved; 1.9 GiB of VRAM stays free at peak (8-user run plus a 520k prefill). Against
+2048-token chunks, 8192-token chunks give identical greedy output on the 8 identity prompts and identical next-token
+distributions at short context; at long context KL is 0.0019 mean / 0.0053 max (the 6-bit KV cache itself: 0.0065).
 
 ## What it takes
 
@@ -74,7 +80,7 @@ git checkout 564f8fb && git apply /path/to/repo/deploy/tabbyapi-prefill-chunk-si
 pip install .
 cp /path/to/repo/deploy/sampler_overrides/qwen38_thinking.yml sampler_overrides/ && cd ..
 
-# 1M context: apply the YaRN factor-4 change to the model's config.json
+# long context (needed for the 640k limit): apply the YaRN factor-4 change to the model's config.json
 cd /path/to/models/Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8 && patch -p1 < /path/to/repo/deploy/model-config-yarn4.patch
 
 # edit deploy/config.yml: model_dir, draft_model_dir, network.port, auth; then
@@ -89,7 +95,8 @@ TABBY=$PWD/tabbyAPI ENGINE=$PWD/exllamav3 GPU=0 ./deploy/launch.sh
 
 |Change|Where|Effect|Numerics|
 |---|---|---|---|
-|KV cache 8-bit → 6-bit (`cache_mode: '6,6'`), pool 2,555,904 → 3,121,152 tokens|config|+22 % context capacity, speed unchanged|slightly lossy: top-20 KL 0.018 short / 0.0065 long context, accuracy unchanged|
+|KV cache 8-bit → 6-bit (`cache_mode: '6,6'`), pool 2,555,904 → 2,999,808 tokens|config|+17 % context capacity, speed unchanged|slightly lossy: top-20 KL 0.018 short / 0.0065 long context, accuracy unchanged|
+|Prefill chunks 2048 → 8192 (`chunk_size: 8192`), per-request limit 640k|config|cold prefill +33 % at 32k, +36 % at 128k, 520k in 98 s instead of 131 s|identical greedy output on the identity prompts; long-context KL 0.0019 mean / 0.0053 max|
 |Cooperative MoE k-loop for 3-bit experts|patch 0001|1 user +4.7 %, 2-4 users +9 %|bit-identical|
 |No per-layer expert-count readback to the host in the fused MoE tier|patch 0003|2 users +20-23 %, 4 users +8 %|bit-identical|
 |Verify windows up to 64 rows through the coop MoE kernels|patch 0004, `EXL3_MOE_COOP_ROWS=64`|8 users +20 %|same next-token distributions|
@@ -104,9 +111,9 @@ Each row was measured as an A/B against the step before it. Ports from the
 
 Tried and left out: the built-in MTP drafter (needs 18 % less KV to fit; prose +11.5 % but code and math −15 %),
 dense DGEMV for the 6/7-bit dense projections (changes greedy output, net neutral), adaptive prefill chunk sizing
-(+3.4 % at 128k, slower decode; in the tree as `EXL3_PREFILL_ADAPTIVE`, off), piecewise decode CUDA graphs
-(+3 % at 8 users for 474 MiB of VRAM), draft confidence 0.30 (+4-6 % single-stream decode, −4 % at 4 users,
-changes greedy text).
+(+3.4 % at 128k, slower decode; in the tree as `EXL3_PREFILL_ADAPTIVE`, off), 16384-token prefill chunks (out of
+memory on a 32k prompt at the 3M pool), piecewise decode CUDA graphs (+3 % at 8 users for 474 MiB of VRAM), draft
+confidence 0.30 (+4-6 % single-stream decode, −4 % at 4 users, changes greedy text).
 
 ## Details
 
@@ -117,8 +124,13 @@ against the native 262k context, YaRN factor 4 cost speed on code-like continuat
 nothing on prose.
 
 **KV capacity.** 6-bit K/V costs 13.5 KiB per token; 3.75 KiB of that is fixed fp16 planes for the sparse-attention
-indexer. The pool is allocated at load, so `cache_size` is the hard ceiling: 3,121,152 tokens is the largest that
-keeps 1.5 GiB free after an 8-user run and a 520k-token prefill. Any request can use up to 1M tokens of it.
+indexer. The pool is allocated at load, so `cache_size` is the hard ceiling. 2,999,808 tokens (3M rounded to a
+multiple of 256) with 8192-token prefill chunks keeps 1.9 GiB free after an 8-user run and a 520k-token prefill.
+Each request can use up to 655,360 tokens (`max_seq_len`). Eight full-length requests would need 5.2M tokens, more
+than the pool: the generator reserves pages for a request's prompt plus its next output chunk, so when the pool runs
+short a new or continuing request waits for pages rather than failing. In practice requests rarely all grow to 640k
+at once. The largest pool with 2048-token chunks is 3,121,152 tokens; the model supports 1,048,576 tokens per
+request with the YaRN patch, so `max_seq_len` can be raised again for longer single requests.
 
 **Drafting.** DFlash2 drafts 8-token blocks; the verify window is capped at 7 drafts because the fused MoE path
 handles at most 8 rows per sequence. Draft acceptance drives single-stream speed: about 75 % on code and math,
@@ -128,9 +140,9 @@ about 35 % on prose and chat.
 and removes disk reads from the critical path. Streamed from disk (`EXL3_NGRAM_LOCK=0`) it uses ~4 GiB RSS, but a
 cold request can stall when the page cache is under pressure.
 
-**Prefill.** See the prefill table at the top. Throughput rises with prompt length from ~3,500 t/s at 2k to ~4,200
-t/s at 32k-128k and eases to ~4,000 t/s at 520k. The KV cache mode does not change it (130-133 s for the 520k needle
-in every mode tested).
+**Prefill.** See the prefill table at the top. With 8192-token chunks, throughput is ~3,500 t/s at 2k and ~5,300-5,700
+t/s from 32k to 520k; with 2048-token chunks it is ~4,000-4,250 t/s at 32k-520k. The KV cache mode does not change it
+(130-133 s for the 520k needle at 2048-token chunks in every mode tested).
 
 **Server history.** With the drafter attached, a freshly started server's first ~74 decoded tokens can differ
 slightly from later requests; for example a raw `2+2=` as the very first request can complete with 5 instead of 4.
