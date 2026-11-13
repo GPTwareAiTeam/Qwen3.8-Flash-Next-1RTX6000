@@ -27,6 +27,19 @@ Greedy shown for comparison; the shipped qwen38_thinking preset (Qwen's recommen
 slower because sampled tokens accept fewer drafts. The preset column samples at temperature 0.6, top-k 20, top-p 0.95
 (`bench/decode_natural.py` with `SAMPLING=preset`, one run of three repeats).
 
+|Prefill, cold prompt → 1 token|v1|V2|V2 time to first token|
+|---|---|---|---|
+|~2k tokens|3,044-3,268 t/s|3,453-3,507 t/s|0.6-0.8 s|
+|32k|-|4,200-4,260 t/s|7.3-7.5 s|
+|128k|-|4,146-4,240 t/s|~30 s|
+|520k|3,990 t/s (130.2 s)|3,940-3,990 t/s|130-132 s|
+|worst of 5 cold 32k requests|16.5 s (stall)|8.65 s||
+
+Prefill throughput is unchanged: V2's patches target decode, and both use 2048-token chunks (the 2k gap comes from
+separate sessions, not an A/B). What V2 improves is the worst case: with the engram table locked in RAM, a cold
+first request no longer stalls on disk reads. Larger chunks would help long prompts (chunk 8192: +39-40 % at 32k and
+128k) but do not fit next to the full KV pool; see `docs/measurements.md`.
+
 Quality: 22/24 on the exact-answer probe (`bench/accuracy.py`, v1 22/24); a planted fact 520k tokens deep is
 retrieved; 1.6 GiB of VRAM stays free at peak.
 
@@ -115,7 +128,9 @@ about 35 % on prose and chat.
 and removes disk reads from the critical path. Streamed from disk (`EXL3_NGRAM_LOCK=0`) it uses ~4 GiB RSS, but a
 cold request can stall when the page cache is under pressure.
 
-**Prefill.** 2k-token prompts: 3,050-3,500 t/s. 32k-128k: about 4,150-4,250 t/s. 520k: about 4,000 t/s (130 s).
+**Prefill.** See the prefill table at the top. Throughput rises with prompt length from ~3,500 t/s at 2k to ~4,200
+t/s at 32k-128k and eases to ~4,000 t/s at 520k. The KV cache mode does not change it (130-133 s for the 520k needle
+in every mode tested).
 
 **Server history.** With the drafter attached, a freshly started server's first ~74 decoded tokens can differ
 slightly from later requests; for example a raw `2+2=` as the very first request can complete with 5 instead of 4.
