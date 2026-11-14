@@ -38,3 +38,8 @@ draft_model:
 
 sampling:
   override_preset: qwen38_thinking
+
+memory:
+  # Recurrent-state checkpoints for prefix-cache reuse (MB of system RAM). Each checkpoint is ~104 MiB on this model;
+  # the 4096 default holds ~39, which agent workloads with many concurrent long conversations exhaust.
+  sysmem_recurrent_cache: 65536

@@ -55,7 +55,8 @@ distributions at short context; at long context KL is 0.0019 mean / 0.0053 max (
 
 - One RTX PRO 6000 Blackwell (96 GiB). Measured on the Max-Q (300 W) edition.
 - 50 GiB of lockable host RAM for the engram table (memlock ≥ 50 GiB; `launch.sh` checks it), or stream the table
-  from a fast NVMe instead (see below).
+  from a fast NVMe instead (see below), plus up to 64 GiB more for prefix-cache checkpoints
+  (`memory.sysmem_recurrent_cache`, see "Prefix cache under load").
 - The model: [`turboderp/Qwen3.8-Flash-Next-exl3`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/3.18bpw_h6_ng8),
   branch `3.18bpw_h6_ng8` (measured at revision `2bfc9dade6be0b5b42e2b381d7a6cc160c1d409c`). About 100 GiB on disk,
   half of it the engram (n-gram embedding) table.
@@ -152,6 +153,23 @@ cold request can stall when the page cache is under pressure.
 **Prefill.** See the prefill table at the top. With 8192-token chunks, throughput is ~3,500 t/s at 2k and ~5,300-5,700
 t/s from 32k to 520k; with 2048-token chunks it is ~4,000-4,250 t/s at 32k-520k. The KV cache mode does not change it
 (130-133 s for the 520k needle at 2048-token chunks in every mode tested).
+
+**Prefix cache under load.** Reusing a cached prompt prefix on this model needs two things: the prefix's KV pages
+still in the GPU pool, and a saved state for the 36 linear-attention layers at that point (a "recurrent checkpoint",
+~104 MiB each, kept in system RAM). TabbyAPI's default checkpoint budget (`memory.sysmem_recurrent_cache: 4096` MB)
+holds only ~39. Under a coding-agent workload (15-22 concurrent conversations of 50-500k tokens) that budget ran out:
+checkpoints of conversations waiting for their next turn were evicted, every turn re-prefilled from scratch, queues
+passed client timeouts, and timed-out clients resent the same long prompts. Measured on the live server: 93-99 % of
+prompt tokens served from cache with ≤12 conversations in flight, 2-10 % once that pattern set in. `deploy/config.yml`
+therefore sets 65536 MB (~640 checkpoints); right after the change, 77 % of prompt tokens came from cache with a cold
+cache, median queue 2 s and no timeouts.
+
+If you front the server with a router or gateway:
+- keep requests in flight at or below `max_batch_size` (8) and their combined prompts well below the KV pool (we use
+  ~80 %, 2.4M tokens); send the overflow to another backend instead of letting it queue in this server, where every
+  queued long prompt evicts other conversations' cached prefixes;
+- time out on lack of progress (no streamed chunk for N minutes) rather than a fixed total, so long answers are not
+  cut off and then resent in full.
 
 **Server history.** With the drafter attached, a freshly started server's first ~74 decoded tokens can differ
 slightly from later requests; for example a raw `2+2=` as the very first request can complete with 5 instead of 4.

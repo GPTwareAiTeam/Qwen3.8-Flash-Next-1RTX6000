@@ -78,3 +78,21 @@ Chunk-size experiments:
 `deploy/tabbyapi-prefill-chunk-size.patch` adds the separate `prefill_chunk_size` setting that adaptive chunks need.
 To favor context over prefill speed instead, set `chunk_size: 2048` and raise `cache_size` to 3,121,152 and
 `max_seq_len` to 1,048,576.
+
+## Prefix cache under an agent workload
+
+Live server (3M pool, 640k per request, 8192-token chunks, `max_batch_size` 8), 4,612 finished requests over 23 h
+from coding agents through an OpenAI-compatible router.
+
+|period|in flight|requests with a cache hit|prompt tokens from cache|queue median|
+|---|---|---|---|---|
+|09:00-18:59 (≤12 conversations in flight)|p90 5, p99 10|96-99 %|91-99 %|0 s|
+|19:00-08:00 (15-22 in flight, 2.0-2.8M prompt tokens)|15-22|0-70 %|2-10 %|501 s (p90 626 s)|
+|first 10 min after the fix|≤8|80 %|77 % (cold cache)|2 s (max 58 s)|
+
+Cause: the recurrent-checkpoint budget (`memory.sysmem_recurrent_cache` 4096 MB ≈ 39 checkpoints of ~104 MiB: 36
+Gated DeltaNet layers × 48 heads × 128 × 128 fp16 ≈ 54 MiB, plus the drafter's state) and KV-page eviction under
+too many concurrent long prompts. Each miss re-prefilled 50-500k tokens at ~640 t/s while sharing the GPU with 8
+decoding requests, queue time passed the client's 15-minute timeout, and resent requests kept the load up.
+Fix: `sysmem_recurrent_cache: 65536`, plus client-side admission (≤8 in flight, ≤2.4M prompt tokens) and a
+no-progress timeout instead of a fixed total.
