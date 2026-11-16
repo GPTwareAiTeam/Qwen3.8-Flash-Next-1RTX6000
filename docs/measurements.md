@@ -180,7 +180,9 @@ Growable pool + 16k chunks against V2 (same boot order, back to back): cold 2k 3
 
 Decode, A,A,B,B (A = pool preallocated, B = growable + 16k adaptive), c1 307.1 [307.0-307.1] vs 305.9 [305.9-305.9]
 (−0.4 %), c8 681.9 [672.2-691.5] vs 657.4 [649.6-665.2] (−3.6 %, just outside the ±3.5 % band; start loads differed
-by 3.2, past the 3.0 rule, so this block is not valid for a decision). Not shipped; needs a load-matched re-run of c8.
+by 3.2, past the 3.0 rule). Load-matched re-run, A,A,B,B: c1 304.4 [304.0, 304.8] vs 304.3 [303.9, 304.7] (0.0 %),
+c8 680.1 [676.6, 683.6] vs 673.4 [672.6, 674.2] (−1.0 %, inside the ±3.5 % band), decode 2048 code 301.1 vs 303.0
+(+0.6 %). Decode is unchanged. Not shipped by default: off until approved.
 
 ### Decode ports from the QMesh fork (candidate patch 0008), A,A,B,B
 
