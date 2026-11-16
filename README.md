@@ -194,10 +194,12 @@ No setting keeps the decoders within 15 %: every chunk stalls all decoders for i
 first tokens cost decode speed linearly. Lower the cooldown for agent traffic where the new prompt's user is
 waiting; raise it where streaming users must stay smooth.
 
-**Candidates.** `engine/patches-candidates/` holds opt-in patches measured after V2 (all off by default): a
-growable KV pool that leaves an empty pool's VRAM to prefill (+5 % at 32k, +7 % at 128k with 16k chunks, greedy
-identical, long-context KL 0.0016), speculative-decoding readback ports (lossless, no gain here) and prefill
-diagnostics. See its README and `docs/measurements.md`.
+**Candidates.** `engine/patches-candidates/` holds opt-in patches measured after V2 (all off by default). The
+growable KV pool (0010-0015) maps the KV pool as it fills and releases it from the top when requests finish, so an
+empty or drained pool leaves its VRAM to prefill: with 16k chunks, cold 32k +8.0 % and 128k +8.7 % against V2
+(A,A,B,B), c1/c8 −0.3/−0.9 %, greedy identical, long-context KL 0.0016, a clean 90-minute fill/drain soak. Also
+there: speculative-decoding readback ports (lossless, no gain here) and prefill diagnostics. See its README and
+`docs/measurements.md`.
 
 ## Repository
 

@@ -1,0 +1,204 @@
+From 5442556151a453aa90623ab9beb6fa66be523084 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 21:41:27 -0500
+Subject: [PATCH 13/15] Growable KV pool: release mapped pages from the top
+ when the queue drains (EXL3_KV_GROW_DRAIN_FREE_MIB, default 6144), never
+ below the highest referenced page or the premapped region
+ (EXL3_KV_GROW_PREMAP_TOKENS, default 262144); limiter releases torch's cached
+ blocks only when free memory is short
+
+---
+ exllamav3/cache/cache.py             |  8 ++++++
+ exllamav3/cache/grow.py              | 16 +++++++++++
+ exllamav3/cache/vmm.py               |  9 ++++++
+ exllamav3/generator/generator.py     |  3 ++
+ exllamav3/generator/pagetable.py     | 43 +++++++++++++++++++++++++++-
+ exllamav3/generator/prefill_limit.py | 14 ++++++---
+ 6 files changed, 88 insertions(+), 5 deletions(-)
+
+diff --git a/exllamav3/cache/cache.py b/exllamav3/cache/cache.py
+index e03a1049..dbf9df3c 100644
+--- a/exllamav3/cache/cache.py
++++ b/exllamav3/cache/cache.py
+@@ -348,6 +348,14 @@ class Cache:
+         return sum(l.ensure_pages(n) for l in self.layers.values() if getattr(l, "growable", lambda: False)())
+ 
+ 
++    def trim_pages(self, n: int) -> int:
++        """Release physical memory above page n in every growable layer (no kernel in flight may read it); returns
++        VRAM bytes released"""
++        from .grow import set_target
++        set_target(id(self), n)
++        return sum(l.trim_pages(n) for l in self.layers.values() if getattr(l, "growable", lambda: False)())
++
++
+     def unmapped_bytes(self) -> int:
+         """VRAM the growable layers have reserved address space for but not mapped (0 when none grows)"""
+         return sum(l.reserved_bytes() - l.mapped_bytes() for l in self.layers.values()
+diff --git a/exllamav3/cache/grow.py b/exllamav3/cache/grow.py
+index 2a338a66..275ef3ea 100644
+--- a/exllamav3/cache/grow.py
++++ b/exllamav3/cache/grow.py
+@@ -21,6 +21,10 @@ _targets: dict[int, int] = {}
+ def raise_target(cache_id: int, n: int):
+     _targets[cache_id] = max(_targets.get(cache_id, 0), n)
+ 
++
++def set_target(cache_id: int, n: int):
++    _targets[cache_id] = n
++
+ class GrowablePool:
+     """Mixin for cache layers: alloc_pool(name, shape, dtype) creates a page-major pool tensor, growable when
+     EXL3_KV_GROW=1 (else torch.zeros). ensure_pages(n) backs pages [0, n) of every growable tensor"""
+@@ -82,6 +86,18 @@ class GrowablePool:
+         self.backed_pages = n
+         return got
+ 
++    def trim_pages(self, n: int) -> int:
++        """Release physical memory above page n (granule-rounded per tensor); the caller guarantees no kernel in
++        flight reads pages >= n. Returns the VRAM bytes released"""
++        if not self.growable() or n >= self.backed_pages:
++            return 0
++        got = 0
++        for name, r in self.ranges.items():
++            t = getattr(self, name)
++            got += r.trim(n * t.stride(0) * t.element_size())
++        self.backed_pages = n
++        return got
++
+     def mapped_bytes(self) -> int:
+         return sum(r.mapped for r in self.ranges.values()) if self.growable() else 0
+ 
+diff --git a/exllamav3/cache/vmm.py b/exllamav3/cache/vmm.py
+index 7a423a10..a9ad0d30 100644
+--- a/exllamav3/cache/vmm.py
++++ b/exllamav3/cache/vmm.py
+@@ -61,6 +61,15 @@ class VmmRange:
+             ext().vmm_view(self.handle, self.mapped)[before:].zero_()
+         return self.mapped - before
+ 
++    def trim(self, nbytes: int) -> int:
++        """Release physical memory above nbytes (rounded up to a granule, never below the first granule); returns
++        the bytes released. The caller guarantees no queued or running kernel reads the released tail."""
++        before = self.mapped
++        nbytes = max(int(nbytes), self.floor)
++        if nbytes < self.mapped:
++            self.mapped = ext().vmm_shrink(self.handle, nbytes)
++        return before - self.mapped
++
+     def round_up(self, nbytes: int) -> int:
+         g = self.granule
+         return (nbytes + g - 1) // g * g
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index 8e825996..a25f0413 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -217,6 +217,7 @@ class Generator:
+ 
+         # Paging
+         self.pagetable = PageTable(self, cache)
++        self.pagetable.premap()
+         # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
+         cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
+         self.cache_owner_serial = cache.owner_serial
+@@ -953,6 +954,8 @@ class Generator:
+             # Before pruning: a checkpoint stranded in VRAM/RAM terms may be anchored by pages on disk. One
+             # step only; the async generator does the rest while idle (idle_work)
+             self.flush_cache_to_disk(max_pages = self._idle_flush_budget())
++        # Growable KV pool: release mapped pages from the top so the next prompt gets full-size chunks again
++        self.pagetable.shrink()
+         if self.recurrent_cache is not None:
+             self.recurrent_cache.prune_stranded()
+             # The pruned checkpoints' buffers went back to the stash pool; drop them so the RAM
+diff --git a/exllamav3/generator/pagetable.py b/exllamav3/generator/pagetable.py
+index 0f9751e0..d9914233 100644
+--- a/exllamav3/generator/pagetable.py
++++ b/exllamav3/generator/pagetable.py
+@@ -19,9 +19,14 @@ from ..cache import RecurrentCache
+ from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+ from ..util import profile_opt
+ 
+-# Growable KV pool (EXL3_KV_GROW): pages mapped per grow step; EXL3_KV_GROW_LOG=1 logs every grow
++# Growable KV pool (EXL3_KV_GROW): pages mapped per grow step; EXL3_KV_GROW_LOG=1 logs every grow and shrink.
++# EXL3_KV_GROW_PREMAP_TOKENS: pool prefix mapped at start and never released. EXL3_KV_GROW_DRAIN_FREE_MIB: when the
++# queue drains, release pages from the top until the device has this much free (room for full-size prefill
++# chunks), keeping the prompt cache below the cut
+ KV_GROW_STEP = int(os.environ.get("EXL3_KV_GROW_STEP_PAGES", "256"))
+ KV_GROW_LOG = os.environ.get("EXL3_KV_GROW_LOG", "0") == "1"
++KV_GROW_FLOOR = int(os.environ.get("EXL3_KV_GROW_PREMAP_TOKENS", "262144")) // PAGE_SIZE
++KV_GROW_DRAIN_FREE = int(os.environ.get("EXL3_KV_GROW_DRAIN_FREE_MIB", "6144")) << 20
+ 
+ 
+ def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
+@@ -563,6 +568,42 @@ class PageTable:
+                   flush = True)
+ 
+ 
++    def premap(self):
++        """Growable pool: map the fixed starting region (EXL3_KV_GROW_PREMAP_TOKENS) once, at start"""
++        if self.growable and self.cache.backed_pages() < min(KV_GROW_FLOOR, self.max_pages):
++            self.cache.ensure_pages(min(KV_GROW_FLOOR, self.max_pages))
++
++    def shrink(self) -> int:
++        """Growable pool, queue drained: release backed pages from the top down until the device has
++        EXL3_KV_GROW_DRAIN_FREE_MIB free, never below the highest referenced page or the premapped region. Cached
++        prompt pages below the cut are kept, those above are evicted (the caller then prunes stranded recurrent
++        checkpoints). Only with nothing in flight; returns the pages released"""
++        if not self.growable:
++            return 0
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++        free, _ = torch.cuda.mem_get_info()
++        need = KV_GROW_DRAIN_FREE - free
++        backed = self.cache.backed_pages()
++        if need <= 0:
++            return 0
++        pb = max(1, self.cache.page_bytes())
++        top = max((p.page_index for p in self.referenced_pages.values()), default = -1) + 1
++        keep = max(top, min(KV_GROW_FLOOR, self.max_pages), backed - (need + pb - 1) // pb)
++        if keep >= backed:
++            return 0
++        t0 = time.perf_counter()
++        for p in self.all_pages[keep:backed]:
++            if p.ref_count == 0 and p.kv_position:
++                self.evict(p)
++                p.clear()
++        self.cache.trim_pages(keep)
++        self.metrics["trim_pages"] = self.metrics.get("trim_pages", 0) + backed - keep
++        if KV_GROW_LOG:
++            print(f"KV_GROW shrink pages {backed}->{keep} free_MiB={free / 2**20:.0f}->"
++                  f"{torch.cuda.mem_get_info()[0] / 2**20:.0f} ms={(time.perf_counter() - t0) * 1e3:.1f}", flush = True)
++        return backed - keep
++
+     def evict(self, page: CachePage, protect: set | None = None):
+         """
+         An unreferenced page is about to be repurposed and its current identity destroyed. At this point
+diff --git a/exllamav3/generator/prefill_limit.py b/exllamav3/generator/prefill_limit.py
+index 788eebbe..381ea103 100644
+--- a/exllamav3/generator/prefill_limit.py
++++ b/exllamav3/generator/prefill_limit.py
+@@ -120,11 +120,17 @@ class PrefillChunkLimiter:
+ 
+     def _grow_call(self, start: int, chunk: int, alloc: int) -> int:
+         dev = self.device
+-        # Prefill scratch from the previous chunk lives in torch's cache: hand it back to the device so the pool's
+-        # page mapping and this chunk draw from the same free memory, and count only what the device reports free
+-        torch.cuda.empty_cache()
++        # Count only what the device reports free plus torch's cached-but-free blocks, which this chunk can reuse
++        # directly. The cached blocks go back to the device only when that is not enough, so the pool can map new
++        # pages from them (releasing on every chunk costs re-allocation on short prompts)
+         free, total = torch.cuda.mem_get_info(dev)
+-        room = free - PREFILL_MARGIN_MIB * 2 ** 20 - PREFILL_GROW_DECODE_BYTES
++        cached = torch.cuda.memory_reserved(dev) - alloc
++        margin = PREFILL_MARGIN_MIB * 2 ** 20 + PREFILL_GROW_DECODE_BYTES
++        if free - margin < prefill_rise(start, chunk) and cached > 0:
++            torch.cuda.empty_cache()
++            free, total = torch.cuda.mem_get_info(dev)
++            cached = torch.cuda.memory_reserved(dev) - alloc
++        room = free + cached - margin
+         fit = int(prefill_fit(start, room)) // PAGE_SIZE * PAGE_SIZE
+         rows = None
+         for step in (chunk,) + tuple(s for s in PREFILL_LADDER if s < chunk):
+-- 
+2.43.0
+

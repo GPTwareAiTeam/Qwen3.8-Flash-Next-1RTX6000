@@ -1,0 +1,40 @@
+From aab77c4ab9921993d9f12e6eb003f76d61882c66 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 21:41:48 -0500
+Subject: [PATCH 14/15] Prefill limiter (growable pool): room is device-free
+ memory only; torch's cached blocks are released only when that is short
+
+---
+ exllamav3/generator/prefill_limit.py | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/exllamav3/generator/prefill_limit.py b/exllamav3/generator/prefill_limit.py
+index 381ea103..fb2d77a9 100644
+--- a/exllamav3/generator/prefill_limit.py
++++ b/exllamav3/generator/prefill_limit.py
+@@ -120,17 +120,15 @@ class PrefillChunkLimiter:
+ 
+     def _grow_call(self, start: int, chunk: int, alloc: int) -> int:
+         dev = self.device
+-        # Count only what the device reports free plus torch's cached-but-free blocks, which this chunk can reuse
+-        # directly. The cached blocks go back to the device only when that is not enough, so the pool can map new
+-        # pages from them (releasing on every chunk costs re-allocation on short prompts)
++        # Room is only what the device reports free; torch's cached blocks are never counted. They are handed back
++        # to the device only when device-free memory is short of this chunk, so short prompts do not pay a release
++        # and re-allocation per chunk
+         free, total = torch.cuda.mem_get_info(dev)
+-        cached = torch.cuda.memory_reserved(dev) - alloc
+         margin = PREFILL_MARGIN_MIB * 2 ** 20 + PREFILL_GROW_DECODE_BYTES
+-        if free - margin < prefill_rise(start, chunk) and cached > 0:
++        if free - margin < prefill_rise(start, chunk) and torch.cuda.memory_reserved(dev) > alloc:
+             torch.cuda.empty_cache()
+             free, total = torch.cuda.mem_get_info(dev)
+-            cached = torch.cuda.memory_reserved(dev) - alloc
+-        room = free + cached - margin
++        room = free - margin
+         fit = int(prefill_fit(start, room)) // PAGE_SIZE * PAGE_SIZE
+         rows = None
+         for step in (chunk,) + tuple(s for s in PREFILL_LADDER if s < chunk):
+-- 
+2.43.0
+

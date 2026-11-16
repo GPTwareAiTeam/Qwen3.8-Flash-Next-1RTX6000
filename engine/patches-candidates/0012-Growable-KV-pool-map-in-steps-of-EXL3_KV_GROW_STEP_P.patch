@@ -1,7 +1,7 @@
 From 8417faec3f7d675f4c24de75fdb2c35e80914253 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 20:21:42 -0500
-Subject: [PATCH 12/12] Growable KV pool: map in steps of
+Subject: [PATCH 12/15] Growable KV pool: map in steps of
  EXL3_KV_GROW_STEP_PAGES (256 pages) instead of page by page; EXL3_KV_GROW_LOG
  logs each grow with its time
 

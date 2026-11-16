@@ -184,6 +184,77 @@ by 3.2, past the 3.0 rule). Load-matched re-run, A,A,B,B: c1 304.4 [304.0, 304.8
 c8 680.1 [676.6, 683.6] vs 673.4 [672.6, 674.2] (−1.0 %, inside the ±3.5 % band), decode 2048 code 301.1 vs 303.0
 (+0.6 %). Decode is unchanged. Not shipped by default: off until approved.
 
+### Growable pool, round 2 (candidate patches 0013-0015): shrink-back, 2k, MTILE, admission, soak
+
+Engine = V2 + 0010-0015, `EXL3_KV_GROW=1 EXL3_PREFILL_ADAPTIVE=1`, `prefill_chunk_size: 16384`. Patch 0013 releases
+mapped pages from the top when the queue drains, until 10 GiB are free (`EXL3_KV_GROW_DRAIN_FREE_MIB`), never below
+the highest page in use or the first 262,144 tokens, which are mapped at start (`EXL3_KV_GROW_PREMAP_TOKENS`).
+
+**Shrink-back** (shotgun): 5 concurrent cold 500k prompts hold 2.5M tokens at once (424 s); all finish; the pool
+shrinks 9,984 → 9,688 pages in 19 ms; a cold 131k prompt then runs 16384-row chunks throughout, 21.05 s,
+6,229 t/s. With the earlier 6 GiB drain target the same prompt only got 8192-row chunks (23.1 s).
+
+**2k prefill**: still 1.6-4.6 % slower with 262k tokens premapped and the limiter no longer releasing torch's cache
+on every chunk (shotgun 3,600 vs 3,774 t/s; A,A,B,B −1.6 %, inside the ±3.5 % band). Not first-use mapping cost:
+the 2k prompt never maps a page. The remaining gap is the per-chunk free-memory query and the larger load-time
+16k measuring pass. 2k TTFT moves from 0.56 s to 0.58 s.
+
+**MTILE=1 on the growable pool** (shotgun):
+
+|arm|cold 2k t/s|32k|128k|greedy identity|KL short / long|
+|---|---|---|---|---|---|
+|growable|3,600 [562-580 ms]|6,310 [5,181-5,236 ms]|6,208 [21,043-21,157 ms]|—|—|
+|growable + MTILE 1|3,948 (+9.7 %) [512-533 ms]|6,401 (+1.4 %)|6,319 (+1.8 %)|text 6/8, token 7/8|0.003 / 0.003, max 0.009|
+
+Per-position KL along 48-token greedy continuations of the 9 long prompts (276 positions compared up to the first
+token divergence): mean 0.010, 34 positions above 0.01, in 8 of 9 prompts; greedy text diverges within 48 tokens in
+7 of 9. The 157k prompts carry the largest values (0.37-0.50 at single positions, on near-ties such as `<think>`
+0.77 vs 0.37). After a divergence the continuations are different texts (KL 6-19 at the next positions, not
+counted above). A pattern, not one isolated token: the 64-row tile changes the summation order of every
+prefill row, so long contexts drift. The MTILE gain on top of the growable pool is small at 32k/128k (+1.4/+1.8 %).
+
+**Admission past 8 users** (growable pool, shotgun):
+
+|`max_batch_size`|VRAM after load|8 users decoding + cold 131k: TTFT|8 decoders during|c1 / c8|
+|---|---|---|---|---|
+|8|57.7 GiB|180.3 s (waits for a slot)|73 t/s (unaffected)|—|
+|9|57.9 GiB (+148 MiB)|29.4 s|13.4 t/s (−80 %)|306.6 / 673.6|
+|10|58.1 GiB (+348 MiB)|29.4 s|13.3 t/s (−80 %)|303.8 / 678.0|
+
+A ninth slot costs ~150 MiB (one more recurrent state and verify scratch) and turns a 3-minute wait into 29 s,
+paid by ~29 s at a fifth of the speed for the eight running streams. c1/c8 unchanged.
+
+**Soak** (90 min, 15 cycles): each cycle 4 concurrent cold 400k prompts + 2 decoders fill the pool to 87 GiB, all
+finish, then c1, c8 and a cold 131k. 0 errors, 0 illegal memory accesses, 0 out-of-memory, 63 shrinks. c1 median
+293.4 (first three 303.1 / 300.2 / 289.1, last three 293.6 / 292.6 / 296.6), c8 median 689.8 (first 694.8 /
+664.1 / 695.7, last 709.8 / 689.8 / 656.2), cold 131k 20.9-21.4 s throughout. Greedy identity at the end vs the
+start 6/8: both diverging prompts change at a near-tie after ~200 characters, the server-history effect
+described in the README (it also occurs on V2).
+
+### Final A,A,B,B: approved set vs V2 (2026-11-16 00:12-00:44)
+
+A = V2 (live). B = V2 + candidate patches 0010-0015, TabbyAPI patch v3, `prefill_chunk_size: 16384`,
+`EXL3_KV_GROW=1`, `EXL3_PREFILL_ADAPTIVE=1`. 3 runs per suite per boot; start loads 0.4-1.7 (VALID).
+
+|metric|A (A1 / A2)|B (B1 / B2)|Δ|
+|---|---|---|---|
+|c1 t/s|305.3 (305.8 / 304.8)|304.3 (304.4 / 304.2)|−0.3 %|
+|c8 t/s|673.7 (673.2 / 674.1)|667.7 (669.1 / 666.2)|−0.9 %|
+|decode 2048 code|302.1 (303.3 / 301.0)|299.1 (299.6 / 298.6)|−1.0 %|
+|cold 2k t/s|3,585 (3,597 / 3,572)|3,527 (3,537 / 3,516)|−1.6 %|
+|cold 32k t/s|5,745 (5,766 / 5,724)|6,203 (6,201 / 6,204)|**+8.0 %**|
+|cold 128k t/s|5,689 (5,691 / 5,687)|6,184 (6,184 / 6,183)|**+8.7 %**|
+|VRAM peak (whole run)|96,024 / 95,990 MiB|72,004 / 71,964 MiB|−23.5 GiB|
+|greedy identity|8/8|8/8 (text and token)|—|
+|KL short / long|0 / 0 (floor)|0.0000 / 0.0016, max 0.0056|—|
+
+Every run of every suite lies within 1 % of its arm median except one c8 run in A1 (650.0) and one code run per B
+boot (284). Under load (4 users decoding + cold 131k) the B arms ran 27.3 s TTFT with decoders at 12.9 t/s against
+34.3 s / 20.2 t/s: with `prefill_chunk_size: 16384` TabbyAPI's shared chunk defaults to half of it, 8192. Pinned to
+4096 (`shared_chunk_size: 4096`, one boot): 34.6 s [34.3-34.7], decoders 20.0 t/s, identity 8/8, c1 305.3 / c8
+669.3, i.e. V2's behaviour under load. Pin `shared_chunk_size: 4096` with this configuration unless the faster
+first token for new prompts (and slower running streams) is wanted.
+
 ### Decode ports from the QMesh fork (candidate patch 0008), A,A,B,B
 
 B = all three switches on. Start loads 7.0-12.3 (spread 5.3; arms interleaved).

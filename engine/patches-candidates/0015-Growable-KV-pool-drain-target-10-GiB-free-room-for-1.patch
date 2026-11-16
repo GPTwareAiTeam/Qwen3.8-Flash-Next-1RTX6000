@@ -1,0 +1,26 @@
+From 6862ea7d06de0a785105dadb211125db3f6c13b5 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 22:20:36 -0500
+Subject: [PATCH 15/15] Growable KV pool: drain target 10 GiB free, room for
+ 16k-row prefill chunks after a drain
+
+---
+ exllamav3/generator/pagetable.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/exllamav3/generator/pagetable.py b/exllamav3/generator/pagetable.py
+index d9914233..055a944f 100644
+--- a/exllamav3/generator/pagetable.py
++++ b/exllamav3/generator/pagetable.py
+@@ -26,7 +26,7 @@ from ..util import profile_opt
+ KV_GROW_STEP = int(os.environ.get("EXL3_KV_GROW_STEP_PAGES", "256"))
+ KV_GROW_LOG = os.environ.get("EXL3_KV_GROW_LOG", "0") == "1"
+ KV_GROW_FLOOR = int(os.environ.get("EXL3_KV_GROW_PREMAP_TOKENS", "262144")) // PAGE_SIZE
+-KV_GROW_DRAIN_FREE = int(os.environ.get("EXL3_KV_GROW_DRAIN_FREE_MIB", "6144")) << 20
++KV_GROW_DRAIN_FREE = int(os.environ.get("EXL3_KV_GROW_DRAIN_FREE_MIB", "10240")) << 20
+ 
+ 
+ def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
+-- 
+2.43.0
+

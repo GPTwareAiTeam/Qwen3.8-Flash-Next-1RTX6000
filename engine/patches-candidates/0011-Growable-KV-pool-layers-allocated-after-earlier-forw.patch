@@ -1,7 +1,7 @@
 From e603bec81f008e2cb445e9ee9942664ca4611829 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 19:56:45 -0500
-Subject: [PATCH 11/12] Growable KV pool: layers allocated after earlier
+Subject: [PATCH 11/15] Growable KV pool: layers allocated after earlier
  forwards map up to the cache-wide backed prefix; batch-shape forwards back
  their pages whenever EXL3_KV_GROW is set
 
