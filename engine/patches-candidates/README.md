@@ -16,3 +16,23 @@ to off, so with no new environment variables the engine behaves exactly like V2.
 The growable pool ports the growable KV cache of the exllamav3 fork behind
 [QMesh](https://github.com/GPTwareAiTeam/QMesh-1xRTXPro6000-1xGB10) (MIT): `exllamav3/cache/native/vmm_pool.cpp`
 and the `VmmRange` wrapper are taken from it, adapted to the quantized and QSA cache layers used here.
+
+## Running the growable pool
+
+This is the configuration our own server has run since 2026-11-16:
+
+```bash
+git am ../patches/*.patch *.patch                     # on exllamav3 v1.6.4
+cd tabbyAPI && git apply /path/to/repo/deploy/tabbyapi-prefill-chunk-size.patch.v3
+```
+
+`deploy/config.yml`, `model:` section:
+
+```yaml
+  chunk_size: 8192
+  prefill_chunk_size: 16384
+  shared_chunk_size: 4096
+```
+
+and before `deploy/launch.sh` starts the server: `export EXL3_KV_GROW=1 EXL3_PREFILL_ADAPTIVE=1`. The CUDA virtual memory
+module builds on first start (C++ only, a few seconds) and links `libcuda`.
