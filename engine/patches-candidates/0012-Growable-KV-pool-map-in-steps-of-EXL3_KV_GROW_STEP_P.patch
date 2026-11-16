@@ -1,0 +1,64 @@
+From 8417faec3f7d675f4c24de75fdb2c35e80914253 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 20:21:42 -0500
+Subject: [PATCH 12/12] Growable KV pool: map in steps of
+ EXL3_KV_GROW_STEP_PAGES (256 pages) instead of page by page; EXL3_KV_GROW_LOG
+ logs each grow with its time
+
+---
+ exllamav3/generator/pagetable.py | 25 +++++++++++++++++++------
+ 1 file changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/exllamav3/generator/pagetable.py b/exllamav3/generator/pagetable.py
+index 8c03b848..0f9751e0 100644
+--- a/exllamav3/generator/pagetable.py
++++ b/exllamav3/generator/pagetable.py
+@@ -19,6 +19,10 @@ from ..cache import RecurrentCache
+ from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+ from ..util import profile_opt
+ 
++# Growable KV pool (EXL3_KV_GROW): pages mapped per grow step; EXL3_KV_GROW_LOG=1 logs every grow
++KV_GROW_STEP = int(os.environ.get("EXL3_KV_GROW_STEP_PAGES", "256"))
++KV_GROW_LOG = os.environ.get("EXL3_KV_GROW_LOG", "0") == "1"
++
+ 
+ def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
+     hasher = hashlib.blake2b(digest_size = 16)
+@@ -535,19 +539,28 @@ class PageTable:
+ 
+ 
+     def _back(self, page: CachePage):
+-        """Growable pool: map physical memory up to and including this page before anything writes it. Pages are
+-        taken between forwards, when prefill scratch sits in torch's cache: if mapping fails, that cache goes back
+-        to the device and the mapping is retried"""
++        """Growable pool: map physical memory up to and including this page before anything writes it. Mapping is
++        stepped (EXL3_KV_GROW_STEP_PAGES, default 256 pages = 64k tokens) so one map call serves many allocations.
++        Pages are taken between forwards, when prefill scratch sits in torch's cache: if mapping fails, that cache
++        goes back to the device and the mapping is retried"""
+         if not self.growable or page.page_index < self.cache.backed_pages():
+             return
+         before = self.cache.backed_pages()
++        target = min(self.max_pages, (page.page_index // KV_GROW_STEP + 1) * KV_GROW_STEP)
++        t0 = time.perf_counter()
+         try:
+-            self.cache.ensure_pages(page.page_index + 1)
++            self.cache.ensure_pages(target)
+         except RuntimeError:
+             torch.cuda.synchronize()
+             torch.cuda.empty_cache()
+-            self.cache.ensure_pages(page.page_index + 1)
+-        self.metrics["grow_pages"] += page.page_index + 1 - before
++            try:
++                self.cache.ensure_pages(target)
++            except RuntimeError:
++                self.cache.ensure_pages(page.page_index + 1)
++        self.metrics["grow_pages"] += self.cache.backed_pages() - before
++        if KV_GROW_LOG:
++            print(f"KV_GROW pages {before}->{self.cache.backed_pages()} ms={(time.perf_counter() - t0) * 1e3:.1f}",
++                  flush = True)
+ 
+ 
+     def evict(self, page: CachePage, protect: set | None = None):
+-- 
+2.43.0
+

@@ -1,0 +1,157 @@
+From fd6a193ff1ad9f20403cc1339574d8dadd579794 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:07:17 -0500
+Subject: [PATCH] Diagnostics: MoE tier trace (EXL3_MOE_TIER_TRACE) and
+ allocator stats in the adaptive prefill log;
+ EXL3_PREFILL_ADAPTIVE_EMPTY_CACHE releases split blocks before measuring room
+ (default off)
+
+---
+ exllamav3/generator/job.py            |  4 +++
+ exllamav3/generator/prefill_limit.py  | 21 ++++++++++-
+ exllamav3/modules/block_sparse_mlp.py | 50 +++++++++++++++++++++++++++
+ 3 files changed, 74 insertions(+), 1 deletion(-)
+
+diff --git a/exllamav3/generator/job.py b/exllamav3/generator/job.py
+index 80fd2863..27d0b93e 100644
+--- a/exllamav3/generator/job.py
++++ b/exllamav3/generator/job.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++import os
+ import torch
+ from typing import TYPE_CHECKING
+ if TYPE_CHECKING:
+@@ -1680,6 +1681,9 @@ class Job:
+                     seq.prefill_complete = True
+                     if self.generator.prefill_chunk_limit is not None:
+                         self.generator.prefill_chunk_limit.prefill_done()
++                    if os.environ.get("EXL3_MOE_TIER_TRACE", "0") == "1":
++                        from ..modules.block_sparse_mlp import moe_tier_trace_flush
++                        moe_tier_trace_flush()
+ 
+                 if recurrent_last_page:
+                     self.maybe_stash_recurrent(self.generator.recurrent_cache, PAGE_SIZE)
+diff --git a/exllamav3/generator/prefill_limit.py b/exllamav3/generator/prefill_limit.py
+index ea367a4c..c8da0d93 100644
+--- a/exllamav3/generator/prefill_limit.py
++++ b/exllamav3/generator/prefill_limit.py
+@@ -34,6 +34,7 @@ PREFILL_DEPTH_BASE = float(os.environ.get("EXL3_PREFILL_DEPTH_BASE_MIB", "256"))
+ PREFILL_DEPTH_BYTES = float(os.environ.get("EXL3_PREFILL_DEPTH_BYTES", "0"))
+ PREFILL_MARGIN_MIB = float(os.environ.get("EXL3_PREFILL_MARGIN_MIB", "1024"))
+ PREFILL_ADAPTIVE_LOG = os.environ.get("EXL3_PREFILL_ADAPTIVE_LOG", "0") == "1"
++PREFILL_ADAPTIVE_EMPTY_CACHE = os.environ.get("EXL3_PREFILL_ADAPTIVE_EMPTY_CACHE", "0") == "1"
+ 
+ 
+ def _log(message):
+@@ -81,14 +82,30 @@ class PrefillChunkLimiter:
+         # the margin stays free on the card
+         free, _ = torch.cuda.mem_get_info(dev)
+         reserved = torch.cuda.memory_reserved(dev)
++        stats = None
++        inactive_split = 0
++        if PREFILL_ADAPTIVE_EMPTY_CACHE or PREFILL_ADAPTIVE_LOG:
++            stats = torch.cuda.memory_stats(dev)
++            inactive_split = stats.get("inactive_split_bytes.all.current", 0)
++        if PREFILL_ADAPTIVE_EMPTY_CACHE and inactive_split > prefill_rise(start, chunk):
++            torch.cuda.empty_cache()
++            free, _ = torch.cuda.mem_get_info(dev)
++            reserved = torch.cuda.memory_reserved(dev)
++            stats = torch.cuda.memory_stats(dev)
++            inactive_split = stats.get("inactive_split_bytes.all.current", 0)
+         room = free + reserved - alloc - PREFILL_MARGIN_MIB * 2 ** 20
+         rows = max(PAGE_SIZE, min(chunk, int(prefill_fit(start, room)) // PAGE_SIZE * PAGE_SIZE))
+         self.chunks += 1
+         if rows < chunk:
+             self.shrunk += 1
+         if PREFILL_ADAPTIVE_LOG:
++            total = torch.cuda.mem_get_info(dev)[1]
+             _log(f"PREFILL_CHUNK_ADAPT start={start} planned={chunk} rows={rows} room_MiB={room / 2**20:.0f} "
+-                 f"free_MiB={free / 2**20:.0f} reserved_MiB={reserved / 2**20:.0f} alloc_MiB={alloc / 2**20:.0f}")
++                 f"free_MiB={free / 2**20:.0f} reserved_MiB={reserved / 2**20:.0f} alloc_MiB={alloc / 2**20:.0f} "
++                 f"active_MiB={stats.get('active_bytes.all.current', 0) / 2**20:.0f} "
++                 f"inactive_split_MiB={inactive_split / 2**20:.0f} "
++                 f"nontorch_MiB={(total - free - reserved) / 2**20:.0f} "
++                 f"segments={int(stats.get('segment.all.current', 0))}")
+         self.prev = (start, rows, alloc, time.perf_counter())
+         return rows
+ 
+@@ -101,5 +118,7 @@ class PrefillChunkLimiter:
+             _log(f"PREFILL_DONE start={p_start} rows={p_rows} "
+                  f"rise_MiB={(torch.cuda.max_memory_allocated(dev) - p_alloc) / 2**20:.0f} "
+                  f"predicted_MiB={prefill_rise(p_start, p_rows) / 2**20:.0f}")
++        if PREFILL_ADAPTIVE_LOG:
++            _log(f"PREFILL_SUMMARY chunks={self.chunks} shrunk={self.shrunk}")
+         self.prev = None
+         torch.cuda.empty_cache()
+diff --git a/exllamav3/modules/block_sparse_mlp.py b/exllamav3/modules/block_sparse_mlp.py
+index a66250ed..bdf77c20 100644
+--- a/exllamav3/modules/block_sparse_mlp.py
++++ b/exllamav3/modules/block_sparse_mlp.py
+@@ -47,6 +47,30 @@ FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
+ # Fused tier without the per-layer expert-count readback whenever every expert fits the fused kernel
+ # (num_tokens <= fused_rows, single-tile launch); EXL3_MOE_NO_READBACK=0 restores the readback for A/B
+ MOE_NO_READBACK = os.environ.get("EXL3_MOE_NO_READBACK", "1") != "0"
++MOE_TIER_TRACE = os.environ.get("EXL3_MOE_TIER_TRACE", "0") == "1"
++_moe_tier_trace = {"layers": 0, "tokens": 0, "fastpath": [0, 0], "fused16": [0, 0],
++                   "fused32": [0, 0], "fused64": [0, 0], "batchrecon": [0, 0], "perexpert": [0, 0],
++                   "fused_rows": 0, "mtile": 0}
++
++
++def moe_tier_trace_flush():
++    if not MOE_TIER_TRACE or not _moe_tier_trace["layers"]:
++        return
++    t = _moe_tier_trace
++    print("MOE_TIER_TRACE "
++          f"layers={t['layers']} tokens={t['tokens']} "
++          f"fastpath={t['fastpath'][0]}/{t['fastpath'][1]} "
++          f"fused16={t['fused16'][0]}/{t['fused16'][1]} "
++          f"fused32={t['fused32'][0]}/{t['fused32'][1]} "
++          f"fused64={t['fused64'][0]}/{t['fused64'][1]} "
++          f"batchrecon={t['batchrecon'][0]}/{t['batchrecon'][1]} "
++          f"perexpert={t['perexpert'][0]}/{t['perexpert'][1]} "
++          f"fused_rows={t['fused_rows']} mtile={t['mtile']}", file = __import__("sys").stderr, flush = True)
++    for key in ("layers", "tokens", "fastpath", "fused16", "fused32", "fused64", "batchrecon", "perexpert"):
++        if isinstance(t[key], list):
++            t[key][:] = [0, 0]
++        else:
++            t[key] = 0
+ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+ # Rows the fused decode kernels (BC_BlockSparseMLP.run_bszN, exl3_moe_coop) take: multi-user verify windows of up to
+ # COOP_ROWS rows run as one coop launch pair instead of the prefill-shaped fused tier (exl3_moe + expert sort).
+@@ -1204,6 +1228,32 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
+                         if heavy:
+                             from .moe_batch_recon import plan_groups
+                             groups = plan_groups(heavy, lambda e: expert_count_list[e], recon.cap)
++                trace = MOE_TIER_TRACE and num_tokens >= 512
++                if trace:
++                    tc = _moe_tier_trace
++                    tc["layers"] += 1
++                    tc["tokens"] += num_tokens
++                    tc["fused_rows"] = self.fused_rows
++                    tc["mtile"] = int(self.mtile_ok)
++                    if expert_count_list is None:
++                        tc["fastpath"][0] += num_tokens * top_k
++                        tc["fastpath"][1] += num_ex
++                    else:
++                        grouped = {e for grp in groups for e in grp}
++                        for e, c in enumerate(expert_count_list[:num_ex]):
++                            if c <= 0:
++                                continue
++                            if self.fused_mode_buffers is not None and c <= self.fused_rows:
++                                key = "fused16" if not self.mtile_ok or c <= MTILE_T1 else \
++                                      ("fused32" if c <= MTILE_T2 else "fused64")
++                            elif e in grouped:
++                                key = "batchrecon"
++                            else:
++                                key = "perexpert"
++                            tc[key][0] += c
++                            tc[key][1] += 1
++                    if tc["layers"] % 1000 == 0:
++                        moe_tier_trace_flush()
+ 
+                 # Deterministic accumulation (FUSED_DET): every assignment of the fused and
+                 # batched tiers gets a slot in one fp32 scratch (fused experts: count rows each,
+-- 
+2.43.0
+

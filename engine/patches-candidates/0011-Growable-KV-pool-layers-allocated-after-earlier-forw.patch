@@ -1,0 +1,76 @@
+From e603bec81f008e2cb445e9ee9942664ca4611829 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:56:45 -0500
+Subject: [PATCH 11/12] Growable KV pool: layers allocated after earlier
+ forwards map up to the cache-wide backed prefix; batch-shape forwards back
+ their pages whenever EXL3_KV_GROW is set
+
+---
+ exllamav3/cache/cache.py  |  6 +++++-
+ exllamav3/cache/grow.py   | 11 +++++++++++
+ exllamav3/modules/attn.py |  3 ++-
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/exllamav3/cache/cache.py b/exllamav3/cache/cache.py
+index f29cc7f5..e03a1049 100644
+--- a/exllamav3/cache/cache.py
++++ b/exllamav3/cache/cache.py
+@@ -340,7 +340,11 @@ class Cache:
+ 
+ 
+     def ensure_pages(self, n: int) -> int:
+-        """Back pages [0, n) in every growable layer; returns VRAM bytes newly mapped"""
++        """Back pages [0, n) in every growable layer, including layers allocated later; returns VRAM bytes newly
++        mapped"""
++        from .grow import KV_GROW, raise_target
++        if KV_GROW:
++            raise_target(id(self), n)
+         return sum(l.ensure_pages(n) for l in self.layers.values() if getattr(l, "growable", lambda: False)())
+ 
+ 
+diff --git a/exllamav3/cache/grow.py b/exllamav3/cache/grow.py
+index f2c24816..2a338a66 100644
+--- a/exllamav3/cache/grow.py
++++ b/exllamav3/cache/grow.py
+@@ -13,6 +13,13 @@ import torch
+ 
+ KV_GROW = os.environ.get("EXL3_KV_GROW", "0") == "1"
+ 
++# cache_id -> pages every growable layer of that cache must back. Layers are allocated module by module during load,
++# after earlier forwards (the loader's measuring pass) already grew the cache, so a new layer maps up to this at once
++_targets: dict[int, int] = {}
++
++
++def raise_target(cache_id: int, n: int):
++    _targets[cache_id] = max(_targets.get(cache_id, 0), n)
+ 
+ class GrowablePool:
+     """Mixin for cache layers: alloc_pool(name, shape, dtype) creates a page-major pool tensor, growable when
+@@ -42,6 +49,10 @@ class GrowablePool:
+         self.ranges[name] = r
+         t = r.view(dtype, shape)
+         setattr(self, name, t)
++        target = min(_targets.get(self.cache_id, 0), self.num_pages)
++        if target:
++            r.ensure(target * t.stride(0) * t.element_size())
++            self.backed_pages = target
+         return t
+ 
+     def free_pools(self):
+diff --git a/exllamav3/modules/attn.py b/exllamav3/modules/attn.py
+index 68d99c6c..6a896ac7 100644
+--- a/exllamav3/modules/attn.py
++++ b/exllamav3/modules/attn.py
+@@ -108,7 +108,8 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+         # assert (past_len is not None) ^ (cache_seqlens is not None), "Need either past_len or cache_seqlens"
+         assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
+         cache_bsz = min(bsz, cache_bsz)
+-        if cache.growable():
++        from ..cache.grow import KV_GROW
++        if KV_GROW:
+             cache.ensure_pages(cache_bsz * cache_max_seq_len // PAGE_SIZE)
+         block_table = _get_block_table(cache_bsz, cache_max_seq_len // PAGE_SIZE)
+         if past_len is not None:
+-- 
+2.43.0
+

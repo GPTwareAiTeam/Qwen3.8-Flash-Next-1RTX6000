@@ -1,0 +1,171 @@
+From c556c61dedee6b2205250260ef2a5dce3b4bb54c Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 15:22:12 -0500
+Subject: [PATCH] Generator: speculative decoding host readbacks (opt-in):
+ EXL3_SD_DEFER_DRAFT_CONF one pinned readback per draft round for the
+ confidence cut; EXL3_SD_BATCH_READBACK all verify-window samplers launched up
+ front with one synchronize when no per-position constraint applies;
+ EXL3_SD_WINDOW_BATCH one fused greedy launch over the window
+
+---
+ exllamav3/generator/generator.py      | 101 ++++++++++++++++++++++++--
+ exllamav3/generator/sampler/custom.py |   9 +++
+ 2 files changed, 103 insertions(+), 7 deletions(-)
+
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index 2c986392..3523ee84 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -24,6 +24,40 @@ import time
+ import threading
+ from ..tokenizer import MMEmbedding
+ from ..util import profile_opt
++import os
++
++# One host readback per draft round: the drafter's confidence scores and drafted ids (both needed on the host for
++# the confidence cut and the calibrator) are staged through one pinned buffer each and settled by one synchronize,
++# instead of two blocking .cpu() copies. EXL3_SD_DEFER_DRAFT_CONF=1 enables (default off, for A/B)
++_DEFER_DRAFT_CONF = os.environ.get("EXL3_SD_DEFER_DRAFT_CONF", "0") == "1"
++# Batched speculative-window readback: when no per-position constraint advances between the positions of a
++# verify window (see _window_batchable), all W samplers launch up front in serial-loop order and the W tokens
++# read back through one pinned buffer and one synchronize, instead of one blocking readback per position.
++# EXL3_SD_BATCH_READBACK=1 enables (default off, for A/B)
++_SD_BATCH_READBACK = os.environ.get("EXL3_SD_BATCH_READBACK", "0") == "1"
++# Greedy window-batch sampling (needs EXL3_SD_BATCH_READBACK=1): a sampler that is a row-wise pure function of
++# the logits (window_batch_safe: the fused greedy kernel) samples the whole window in one launch.
++# EXL3_SD_WINDOW_BATCH=1 enables (default off, for A/B)
++_SD_WINDOW_BATCH = os.environ.get("EXL3_SD_WINDOW_BATCH", "0") == "1"
++
++
++def _window_batchable(job, W):
++    """Positions of a verify window are independent iff nothing that feeds the sampler changes between them:
++    single sequence, past the first token (NaN check, token healing), no forced tokens, no banned strings or
++    open checkpoint (rewinds and explored-token masks), no filters (active or dormant), no past-ids steps
++    (penalties), no stateful step (Adaptive-P), and the min_new_tokens stop-token mask constant over the
++    window"""
++    return (
++        len(job.sequences) == 1
++        and job.new_tokens >= 1
++        and job.forced_ids is None
++        and job.checkpoint is None
++        and not job.banned_strings
++        and not job.filters
++        and not job.sampler.reqs_past_ids
++        and not getattr(job.sampler, "stateful", True)
++        and (job.new_tokens >= job.min_new_tokens or job.new_tokens + W <= job.min_new_tokens)
++    )
+ 
+ class Generator:
+ 
+@@ -1292,8 +1326,24 @@ class Generator:
+         # its scores are kept so iterate_gen can label the verified positions afterwards
+         draft_conf = params.get("draft_conf")
+         if self.draft_calibrator is not None and draft_conf is not None:
+-            conf = draft_conf[:batch_size, 1:].float().cpu()
+-            ids_full = new_ids[:batch_size, :].cpu()
++            if _DEFER_DRAFT_CONF:
++                w_full = new_ids.shape[1]
++                pc = getattr(self, "_draft_conf_pinned", None)
++                if pc is None or pc.shape[0] < batch_size or pc.shape[1] < w_full:
++                    pc = torch.empty((max(batch_size, self.max_batch_size), w_full), dtype = torch.float,
++                                     pin_memory = True)
++                    self._draft_conf_pinned = pc
++                    self._draft_full_pinned = torch.empty(pc.shape, dtype = torch.long, pin_memory = True)
++                pi = self._draft_full_pinned
++                pc[:batch_size, :w_full].copy_(draft_conf[:batch_size, 1:].float(), non_blocking = True)
++                pi[:batch_size, :w_full].copy_(new_ids[:batch_size, :], non_blocking = True)
++                torch.cuda.synchronize(new_ids.device)
++                # clones: the calibrator keeps them until iterate_gen labels the round, the pinned rows are reused
++                conf = pc[:batch_size, :w_full].clone()
++                ids_full = pi[:batch_size, :w_full].clone()
++            else:
++                conf = draft_conf[:batch_size, 1:].float().cpu()
++                ids_full = new_ids[:batch_size, :].cpu()
+             thr = self.draft_calibrator.threshold()
+             below = conf[:, :window] < thr
+             any_below = below.any(dim = 1)
+@@ -1653,12 +1703,42 @@ class Generator:
+                 job_logits = batch_logits[a:b, :, :]
+                 accepted_length = 1
+                 rejected = 0
+-
+-                for i in range(batch_logits.shape[1]):
++                W = batch_logits.shape[1]
++                staged = None
++                if _SD_BATCH_READBACK and draft_tokens is not None and b - a == 1 and _window_batchable(job, W):
++                    rng_state = job.rng.getstate()
++                    # one pinned row per job of the round: receive_sample may keep references to earlier jobs' tokens
++                    pinned_all = getattr(self, "draft_sample_pinned", None)
++                    if pinned_all is None or pinned_all.shape[0] <= j or pinned_all.shape[1] < W:
++                        pinned_all = torch.empty((max(self.max_batch_size, j + 1), max(W, 16)), dtype = torch.long,
++                                                 pin_memory = True)
++                        self.draft_sample_pinned = pinned_all
++                    pinned_w = pinned_all[j:j + 1]
++                    if (_SD_WINDOW_BATCH and W > 1 and getattr(job.sampler, "window_batch_safe", False)
++                            and not job.return_probs and not job.return_top_tokens):
++                        tok_w = job.receive_logits(job_logits)[0]
++                        pinned_w[:, :W].copy_(tok_w.view(1, W), non_blocking = True)
++                        staged = [(pinned_w[:, i:i + 1], None, None, None) for i in range(W)]
++                        draws = 1
++                    else:
++                        staged = []
++                        draws = W
++                        for i in range(W):
++                            s = job.receive_logits(job_logits[:, i:i + 1, :])
++                            pinned_w[:, i:i + 1].copy_(s[0].view(1, 1), non_blocking = True)
++                            staged.append((pinned_w[:, i:i + 1],) + tuple(s[1:]))
++                    torch.cuda.synchronize(batch_logits.device)
++                positions_used = 0
++
++                for i in range(W):
++                    positions_used = i + 1
+                     token_logits = job_logits[:, i:i + 1, :]
+-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+-                        token_logits,
+-                    )
++                    if staged is not None:
++                        next_token, next_k_tokens, next_k_probs, next_prob = staged[i]
++                    else:
++                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
++                            token_logits,
++                        )
+                     eos, sampled_token, rq = job.receive_sample(
+                         token_logits,
+                         next_token,
+@@ -1738,6 +1818,13 @@ class Generator:
+                             job.prepare_logit_mask()
+                             job.prepare_sampling_past_ids()
+ 
++                if staged is not None and draws != positions_used:
++                    # The serial loop draws one sampler seed per position it reaches; the staged pass drew `draws`.
++                    # Rewind the job's RNG and replay only the draws the serial loop would have made
++                    job.rng.setstate(rng_state)
++                    for _ in range(positions_used):
++                        job.rng.randint(0, (1 << 32) - 1)
++
+                 # Make sure outgoing state is valid if entire draft was accepted
+                 if batch_states and draft_tokens is not None and rejected == 0:
+                     batch_states[j].rewind(0)
+diff --git a/exllamav3/generator/sampler/custom.py b/exllamav3/generator/sampler/custom.py
+index 30ce151a..ebbab016 100644
+--- a/exllamav3/generator/sampler/custom.py
++++ b/exllamav3/generator/sampler/custom.py
+@@ -1183,6 +1183,15 @@ class CustomSampler(Sampler):
+                         self.steps.append(prep_step())
+                 self.steps.append(step)
+ 
++        # Stateful steps carry state across calls (Adaptive-P's running average), so their positions cannot be
++        # sampled ahead of acceptance. A lone fused greedy step is a row-wise argmax: sampling a [W, V] window in
++        # one launch gives each row the token the per-position calls give (generator EXL3_SD_WINDOW_BATCH)
++        self.stateful = any(isinstance(s, SS_AdaptiveP) for s in self.steps)
++        self.window_batch_safe = (
++            self.fused_only and len(self.steps) == 1 and isinstance(self.steps[0], SS_Fused)
++            and self.steps[0].mode == SS_Fused.MODE_GREEDY
++        )
++
+ 
+     @override
+     @torch.inference_mode
+-- 
+2.43.0
+

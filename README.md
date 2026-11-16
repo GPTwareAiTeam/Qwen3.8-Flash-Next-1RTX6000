@@ -177,11 +177,33 @@ The launcher's 128-token warm-up absorbs this. More generally, greedy text on th
 what the server has decoded since start (near-tie tokens; next-token distributions are unaffected). v1
 behaves the same way.
 
+**Prefill while others decode.** A new prompt shares the GPU with running decodes: by default it takes one
+4096-token chunk every fifth generator step. With four users decoding, a cold 131k prompt reaches its first token
+in 35 s and the decoders run at about a fifth of their speed meanwhile. TabbyAPI patch v3
+(`deploy/tabbyapi-prefill-chunk-size.patch.v3`) exposes the two knobs: `prefill_cooldown` (steps between chunks)
+and `shared_chunk_size`. Measured, 4 decoders + one cold 131k prompt:
+
+|`prefill_cooldown` / `shared_chunk_size`|time to first token|decoders during the prefill|
+|---|---|---|
+|16 / 2048|86 s|−30 %|
+|8 / 4096|41 s|−71 %|
+|4 / 4096 (default)|35 s|−80 %|
+|0 / 8192|25 s|−96 %|
+
+No setting keeps the decoders within 15 %: every chunk stalls all decoders for its whole duration, so faster
+first tokens cost decode speed linearly. Lower the cooldown for agent traffic where the new prompt's user is
+waiting; raise it where streaming users must stay smooth.
+
+**Candidates.** `engine/patches-candidates/` holds opt-in patches measured after V2 (all off by default): a
+growable KV pool that leaves an empty pool's VRAM to prefill (+5 % at 32k, +7 % at 128k with 16k chunks, greedy
+identical, long-context KL 0.0016), speculative-decoding readback ports (lossless, no gain here) and prefill
+diagnostics. See its README and `docs/measurements.md`.
+
 ## Repository
 
 ```
-deploy/   launch.sh, config.yml, YaRN config patch, TabbyAPI patch
-engine/   exllamav3 patch series and its README
+deploy/   launch.sh, config.yml, YaRN config patch, TabbyAPI patches (v2; v3 adds prefill pacing)
+engine/   exllamav3 patch series and its README; patches-candidates/ for opt-in post-V2 work
 bench/    the harnesses behind the tables (matrix, decode, accuracy, cold time-to-first-token)
 ```
 

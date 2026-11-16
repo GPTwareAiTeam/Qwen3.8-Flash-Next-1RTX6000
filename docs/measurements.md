@@ -96,3 +96,119 @@ too many concurrent long prompts. Each miss re-prefilled 50-500k tokens at ~640 
 decoding requests, queue time passed the client's 15-minute timeout, and resent requests kept the load up.
 Fix: `sysmem_recurrent_cache: 65536`, plus client-side admission (≤8 in flight, ≤2.4M prompt tokens) and a
 no-progress timeout instead of a fixed total.
+
+## Prefill V3 candidates (2026-11-15)
+
+All MEASURED on one RTX PRO 6000 Max-Q with the V2 release config (6,6 KV, 2,999,808-token pool, 8192-token
+chunks, bs 8, DFlash2 n7 at confidence 0.45) unless stated. "Shotgun" = one server boot per arm, 3 runs per
+suite, median with the run spread in brackets; "A,A,B,B" = four boots in that order, median of the two arm
+medians. Greedy identity = the 8 fixed prompts, 128 tokens, text and token sequence. KL = next-token KL over the
+top-20 on 16 short prompts and 9 long prompts (8.7k / 35k / 157k tokens).
+
+### MoE fused-tier row tiles (`EXL3_MOE_MTILE=1`), shotgun
+
+Tier trace on one cold 32k prefill (188 MoE layer passes, 1,540,096 rows, 10 experts per row):
+
+|MTILE|fused tier capacity|rows fused, 16-row tile|32-row tile|64-row tile|batched reconstruct|
+|---|---|---|---|---|---|
+|0 (V2)|128 rows|1,590,002 (10 %)|—|—|13,810,958 (90 %)|
+|1|256 rows|112,790|165,049|3,445,459 (24 % total fused)|11,677,662 (76 %)|
+
+|arm|cold 2k t/s|32k|128k|c1 t/s|c8 t/s|peak MiB|identity vs V2|KL short / long (mean, max)|
+|---|---|---|---|---|---|---|---|---|
+|MTILE 0 (V2)|3,590 [561-601 ms]|5,761|5,603|297|653|95,918|—|—|
+|MTILE 1|3,945 (+9.9 %)|5,954 (+3.4 %)|5,843 (+4.3 %)|299 [269-299]|653|95,990|text 4/8, token 7/8|0.004 / 0.007, max 0.057|
+|MTILE 1, fused rows 384|3,978|5,977|5,830|298|654|95,908|text 5/8, token 7/8|—|
+|MTILE 1, fused rows 512|3,926|5,912|5,768|295|653|95,926|token 5/8|—|
+
+Not bit-identical (the 64-row tile accumulates in a different order); top-1 agreement 25/25. Not shipped: it
+changes greedy output.
+
+### Prefill while other requests decode (`prefill_cooldown` / `shared_chunk_size`, TabbyAPI patch v3), shotgun
+
+Four users stream forced 16k-token decodes; after 20 s one cold 131k-token prompt arrives. TTFT is that prompt's
+wall time; slowdown is the decoders' per-user rate during its prefill against the 15 s before (≈100 t/s each).
+
+|cooldown|shared chunk|TTFT s [3 runs]|decoder slowdown|
+|---|---|---|---|
+|16|2048|86.0 [86.0-86.1]|30 %|
+|16|4096|53.6 [53.5-54.4]|54 %|
+|8|2048|60.7 [60.2-60.8]|59 %|
+|8|4096|41.4 [41.2-41.6]|71 %|
+|4|2048|48.0 [47.8-48.1]|73 %|
+|**4 (V2)**|**4096**|**35.0 [33.9-35.2]**|**80 %**|
+|2|4096|32.0 [31.9-32.0]|87 %|
+|1|4096|30.4 [30.3-30.4]|91 %|
+|0|4096|28.8 [28.8-28.9]|96 %|
+|4|8192|27.7 [27.6-27.8]|87 %|
+|2|8192|27.0 [26.2-43.8]|92 %|
+|1|8192|25.4 [25.2-25.5]|94 %|
+|0|8192|24.6 [24.5-24.6]|96 %|
+
+With 7 decoders (default setting): TTFT 37.9 s, slowdown 73 %. With 8 decoders all batch slots are taken and
+the new prompt waits for a slot (≈180 s here). No setting keeps the slowdown under 15 %: each prefill chunk
+stalls every decoder for its full duration, so the trade is linear in how often chunks run. The defaults stay.
+
+### Adaptive chunks at 16384 with the pool preallocated (patch 0006 + limiter diagnostics), shotgun
+
+At load the 3M-token pool takes the card: allocator active = allocated = 92.8 GiB, inactive split blocks 0, ~2.2 GiB
+of room. The limiter cuts every 16k chunk to 7.9-9.0k rows; releasing torch's cached blocks first changes nothing.
+Measured rise per chunk 1.63-1.85 GiB at 7.9-9.0k rows. Cold prefill: 32k 5,611 t/s, 128k 5,690 t/s (V2 5,761 /
+5,603). Memory is held by the pool, not fragmented; see the growable pool below.
+
+### Growable KV pool (candidate patches 0010-0012, `EXL3_KV_GROW=1`)
+
+The pool is reserved as virtual address space and mapped as pages are used, so an empty pool leaves its VRAM free
+for prefill. Shotgun, `prefill_chunk_size: 16384`, `EXL3_PREFILL_ADAPTIVE=1`:
+
+|stage|VRAM used|chunks the limiter chose|result|
+|---|---|---|---|
+|after load|54.5 GiB (V2: 93.9)|—|—|
+|cold 131k on the empty pool|—|16384 × 8|21.2 s, 6,196 t/s (V2 8192-chunk: 5,603)|
+|filling to 2.5M tokens (5 × 500k cold prompts)|→ 88 GiB|16384, last chunk of each prompt 8.6k|86 s per 500k (≈5,800 t/s)|
+|cold 131k on the 2.5M-token pool|94.2 GiB|4096 × 32 (one 8192 step at 2.8M)|21.5 s, 6,095 t/s|
+|131k arriving while 4 users decode, pool full|—|—|TTFT 34.8 s, decoders −81 % (V2 default 35.0 s, −80 %)|
+
+No out-of-memory and no failed requests across the fill. Every prompt was cold (no cached tokens): at this depth
+4096-row chunks prefill as fast as 16384-row ones, so on this model the growable pool's gain comes from the
+first chunks of a prompt, not from chunk size later on. Greedy identity 8/8 against the same engine with the pool
+preallocated; c1 and c8 below.
+
+Growable pool + 16k chunks against V2 (same boot order, back to back): cold 2k 3,556 vs 3,689 t/s (−3.6 %), 32k
+6,248 vs 5,953 (+5.0 %), 128k 6,168 vs 5,776 (+6.8 %); runs within 1 %. KL: short 0.0000, long mean 0.0016, max
+0.0056 (V2 run-to-run floor 0.0000; the 3M/8192 V2 change measured 0.0019 / 0.0053). Greedy identity 8/8.
+
+Decode, A,A,B,B (A = pool preallocated, B = growable + 16k adaptive), c1 307.1 [307.0-307.1] vs 305.9 [305.9-305.9]
+(−0.4 %), c8 681.9 [672.2-691.5] vs 657.4 [649.6-665.2] (−3.6 %, just outside the ±3.5 % band; start loads differed
+by 3.2, past the 3.0 rule, so this block is not valid for a decision). Not shipped; needs a load-matched re-run of c8.
+
+### Decode ports from the QMesh fork (candidate patch 0008), A,A,B,B
+
+B = all three switches on. Start loads 7.0-12.3 (spread 5.3; arms interleaved).
+
+|metric|A|B|Δ|
+|---|---|---|---|
+|c1 t/s|300.4 [299.3, 301.5]|297.6 [295.2, 300.1]|−0.9 %|
+|c8 t/s|655.8 [649.7, 661.9]|652.6 [652.3, 653.0]|−0.5 %|
+|decode 2048 code|295.0|294.3|−0.3 %|
+|greedy identity|8/8|8/8|—|
+|KL short / long|0 / 0|0 / 0|—|
+
+Single-switch shotgun arms: defer-confidence c1 304.6 / c8 661.6, batch readback 300.0 / 656.8, window batch
+301.0 / 654.1, off 299.2 / 652.9. Lossless but no measurable gain on this stack: the sync the ports remove is
+short next to the verify forward. Not shipped.
+
+### Where cold prefill time goes (nsys, one cold 32k prefill, 8192-token chunks, V2 engine)
+
+Kernel time by NVTX range of the launch (5.51 s of GPU work, 4.9 % idle in the span):
+
+|component|share|
+|---|---|
+|routed MoE (fused + batched reconstruct + gather)|41.5 %|
+|layer glue (gated residual mix/apply, norms, copies)|18.7 %|
+|sparse-attention QSA indexer (`_qsa_sparse_split_kernel` alone 15.8 %)|17.4 %|
+|Gated DeltaNet layers (projections + chunked delta rule)|16.8 %|
+|full attention|3.9 %|
+|shared expert|1.4 %|
+|engram / embeddings|<0.1 %|
+|DFlash2 drafter|<0.1 % (detached: 32k 5,808 vs 5,761 t/s attached, −2.3 GiB VRAM)|

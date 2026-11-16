@@ -1,0 +1,603 @@
+From c4f339814e567b8c872ae19a640d0f953353f855 Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:34:20 -0500
+Subject: [PATCH 10/12] Cache: growable KV pool (EXL3_KV_GROW, default off),
+ port of the QMesh growable cache: quant K/V and QSA plane pools reserved as
+ CUDA virtual ranges, physical pages mapped in 2 MiB granules as the page
+ table hands pages out (lowest unbacked page first, no defrag); adaptive
+ prefill limiter on a growable pool counts only device-free memory (torch
+ cache released first) and steps planned/8192/4096/2048
+
+---
+ exllamav3/cache/cache.py             |  31 ++++++++
+ exllamav3/cache/grow.py              |  78 +++++++++++++++++++
+ exllamav3/cache/native/vmm_pool.cpp  | 112 +++++++++++++++++++++++++++
+ exllamav3/cache/qsa.py               |   9 ++-
+ exllamav3/cache/quant.py             |  15 ++--
+ exllamav3/cache/vmm.py               |  72 +++++++++++++++++
+ exllamav3/generator/generator.py     |   2 +-
+ exllamav3/generator/pagetable.py     |  39 +++++++++-
+ exllamav3/generator/prefill_limit.py |  38 ++++++++-
+ exllamav3/modules/attn.py            |   2 +
+ 10 files changed, 386 insertions(+), 12 deletions(-)
+ create mode 100644 exllamav3/cache/grow.py
+ create mode 100644 exllamav3/cache/native/vmm_pool.cpp
+ create mode 100644 exllamav3/cache/vmm.py
+
+diff --git a/exllamav3/cache/cache.py b/exllamav3/cache/cache.py
+index 674ccc7b..f29cc7f5 100644
+--- a/exllamav3/cache/cache.py
++++ b/exllamav3/cache/cache.py
+@@ -319,6 +319,37 @@ class Cache:
+             tensors += layer.get_tensors()
+         return tensors
+ 
++    def growable(self) -> bool:
++        """True when some layer maps its pages on demand (EXL3_KV_GROW)"""
++        return any(getattr(l, "growable", lambda: False)() for l in self.layers.values())
++
++
++    def backed_pages(self) -> int:
++        """Pages [0, n) every growable layer has physical memory for (all pages when none grows)"""
++        from ..constants import PAGE_SIZE
++        n = self.max_num_tokens // PAGE_SIZE
++        for l in self.layers.values():
++            if getattr(l, "growable", lambda: False)():
++                n = min(n, l.backed_pages)
++        return n
++
++
++    def page_bytes(self) -> int:
++        """VRAM one more backed page costs across all growable layers"""
++        return sum(l.page_bytes() for l in self.layers.values() if getattr(l, "growable", lambda: False)())
++
++
++    def ensure_pages(self, n: int) -> int:
++        """Back pages [0, n) in every growable layer; returns VRAM bytes newly mapped"""
++        return sum(l.ensure_pages(n) for l in self.layers.values() if getattr(l, "growable", lambda: False)())
++
++
++    def unmapped_bytes(self) -> int:
++        """VRAM the growable layers have reserved address space for but not mapped (0 when none grows)"""
++        return sum(l.reserved_bytes() - l.mapped_bytes() for l in self.layers.values()
++                   if getattr(l, "growable", lambda: False)())
++
++
+ 
+     def alloc_state(self, layer_instance, device: torch.Device):
+         """
+diff --git a/exllamav3/cache/grow.py b/exllamav3/cache/grow.py
+new file mode 100644
+index 00000000..f2c24816
+--- /dev/null
++++ b/exllamav3/cache/grow.py
+@@ -0,0 +1,78 @@
++"""Growable KV pool (EXL3_KV_GROW=1, default off).
++
++Every page-major pool tensor ([num_pages, ...]) of a cache layer is a view of a VmmRange: the full pool is reserved
++as virtual address space at load, physical memory is mapped only for the page prefix the page table has handed out,
++in 2 MiB granules. Base addresses never move, so captured CUDA graphs stay valid. With the pool mostly empty the
++unmapped part is free VRAM, which the adaptive prefill limiter can spend on larger chunks.
++"""
++from __future__ import annotations
++
++import os
++
++import torch
++
++KV_GROW = os.environ.get("EXL3_KV_GROW", "0") == "1"
++
++
++class GrowablePool:
++    """Mixin for cache layers: alloc_pool(name, shape, dtype) creates a page-major pool tensor, growable when
++    EXL3_KV_GROW=1 (else torch.zeros). ensure_pages(n) backs pages [0, n) of every growable tensor"""
++
++    def _grow_init(self):
++        if not hasattr(self, "ranges"):
++            self.ranges = None
++            self.backed_pages = None
++
++    def alloc_pool(self, device, name: str, shape: tuple, dtype: torch.dtype):
++        self._grow_init()
++        if not KV_GROW:
++            t = torch.zeros(shape, dtype = dtype, device = device)
++            setattr(self, name, t)
++            return t
++        from .vmm import VmmRange
++        if self.ranges is None:
++            self.ranges = {}
++            self.backed_pages = 0
++            self.num_pages = shape[0]
++        assert shape[0] == self.num_pages
++        n = 1
++        for s in shape:
++            n *= s
++        r = VmmRange(device, n * torch.empty((), dtype = dtype).element_size())
++        self.ranges[name] = r
++        t = r.view(dtype, shape)
++        setattr(self, name, t)
++        return t
++
++    def free_pools(self):
++        for r in (getattr(self, "ranges", None) or {}).values():
++            r.free()
++        self.ranges = None
++        self.backed_pages = None
++
++    def growable(self) -> bool:
++        return bool(getattr(self, "ranges", None))
++
++    def page_bytes(self) -> int:
++        """VRAM one more backed page costs across this layer's growable tensors"""
++        if not self.growable():
++            return 0
++        return sum(getattr(self, name)[0].numel() * getattr(self, name).element_size() for name in self.ranges)
++
++    def ensure_pages(self, n: int) -> int:
++        """Back pages [0, n) of every growable tensor (zero-filled); returns the VRAM bytes newly mapped"""
++        if not self.growable() or n <= self.backed_pages:
++            return 0
++        n = min(n, self.num_pages)
++        got = 0
++        for name, r in self.ranges.items():
++            t = getattr(self, name)
++            got += r.ensure(n * t.stride(0) * t.element_size())
++        self.backed_pages = n
++        return got
++
++    def mapped_bytes(self) -> int:
++        return sum(r.mapped for r in self.ranges.values()) if self.growable() else 0
++
++    def reserved_bytes(self) -> int:
++        return sum(r.reserved for r in self.ranges.values()) if self.growable() else 0
+diff --git a/exllamav3/cache/native/vmm_pool.cpp b/exllamav3/cache/native/vmm_pool.cpp
+new file mode 100644
+index 00000000..96c2bfb6
+--- /dev/null
++++ b/exllamav3/cache/native/vmm_pool.cpp
+@@ -0,0 +1,112 @@
++// Growable device pool on CUDA virtual memory management (driver API): reserve a virtual range for the maximum size
++// once, map physical chunks into it on demand (grow) and unmap them again (shrink). The base address never moves, so
++// kernels and captured CUDA graphs that bake it stay valid. Exposed to torch as a tensor view of the full range;
++// only [0, mapped) may be touched.
++#include <torch/extension.h>
++#include <cuda.h>
++#include <vector>
++
++namespace {
++
++#define CU(x) do { CUresult r_ = (x); if (r_ != CUDA_SUCCESS) { const char* s_ = nullptr; cuGetErrorString(r_, &s_); \
++    TORCH_CHECK(false, #x " failed: ", s_ ? s_ : "?"); } } while (0)
++
++struct Pool {
++    int device;
++    CUdeviceptr base = 0;
++    size_t reserved = 0, granule = 0, mapped = 0;
++    std::vector<CUmemGenericAllocationHandle> chunks;     // one per granule, in address order
++};
++
++CUmemAllocationProp prop_for(int device)
++{
++    CUmemAllocationProp p = {};
++    p.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++    p.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    p.location.id = device;
++    return p;
++}
++
++}  // namespace
++
++int64_t vmm_create(int64_t device, int64_t max_bytes)
++{
++    CU(cuInit(0));
++    auto* p = new Pool();
++    p->device = (int) device;
++    CUmemAllocationProp prop = prop_for(p->device);
++    CU(cuMemGetAllocationGranularity(&p->granule, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
++    p->reserved = (max_bytes + p->granule - 1) / p->granule * p->granule;
++    CU(cuMemAddressReserve(&p->base, p->reserved, p->granule, 0, 0));
++    return (int64_t) p;
++}
++
++// Map physical memory so that at least `bytes` from the base are backed. Returns the mapped size.
++int64_t vmm_grow(int64_t h, int64_t bytes)
++{
++    auto* p = (Pool*) h;
++    TORCH_CHECK((size_t) bytes <= p->reserved, "vmm_grow: ", bytes, " > reserved ", p->reserved);
++    CUmemAllocationProp prop = prop_for(p->device);
++    CUmemAccessDesc acc = {};
++    acc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    acc.location.id = p->device;
++    acc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++    while (p->mapped < (size_t) bytes)
++    {
++        CUmemGenericAllocationHandle c;
++        CU(cuMemCreate(&c, p->granule, &prop, 0));
++        CU(cuMemMap(p->base + p->mapped, p->granule, 0, c, 0));
++        CU(cuMemSetAccess(p->base + p->mapped, p->granule, &acc, 1));
++        p->chunks.push_back(c);
++        p->mapped += p->granule;
++    }
++    return (int64_t) p->mapped;
++}
++
++// Unmap and release physical memory down to `bytes` (rounded up to a granule). Caller guarantees nothing in flight
++// reads the released tail (synchronize first). Returns the mapped size.
++int64_t vmm_shrink(int64_t h, int64_t bytes)
++{
++    auto* p = (Pool*) h;
++    size_t keep = ((size_t) bytes + p->granule - 1) / p->granule * p->granule;
++    while (p->mapped > keep)
++    {
++        p->mapped -= p->granule;
++        CU(cuMemUnmap(p->base + p->mapped, p->granule));
++        CU(cuMemRelease(p->chunks.back()));
++        p->chunks.pop_back();
++    }
++    return (int64_t) p->mapped;
++}
++
++at::Tensor vmm_view(int64_t h, int64_t nbytes)
++{
++    auto* p = (Pool*) h;
++    TORCH_CHECK((size_t) nbytes <= p->reserved);
++    return torch::from_blob((void*) p->base, {nbytes}, [](void*) {},
++                            torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, p->device));
++}
++
++std::vector<int64_t> vmm_info(int64_t h)
++{
++    auto* p = (Pool*) h;
++    return { (int64_t) p->base, (int64_t) p->reserved, (int64_t) p->mapped, (int64_t) p->granule };
++}
++
++void vmm_destroy(int64_t h)
++{
++    auto* p = (Pool*) h;
++    vmm_shrink(h, 0);
++    cuMemAddressFree(p->base, p->reserved);
++    delete p;
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
++{
++    m.def("vmm_create", &vmm_create);
++    m.def("vmm_grow", &vmm_grow);
++    m.def("vmm_shrink", &vmm_shrink);
++    m.def("vmm_view", &vmm_view);
++    m.def("vmm_info", &vmm_info);
++    m.def("vmm_destroy", &vmm_destroy);
++}
+diff --git a/exllamav3/cache/qsa.py b/exllamav3/cache/qsa.py
+index dad79e3f..5b0b3df5 100644
+--- a/exllamav3/cache/qsa.py
++++ b/exllamav3/cache/qsa.py
+@@ -33,8 +33,13 @@ class QSAPlanes:
+     @override
+     def alloc(self, device: torch.device):
+         super().alloc(device)
+-        self.raw_k = torch.zeros(self.raw_k_shape, dtype = torch.half, device = device)
+-        self.pooled = torch.zeros(self.pooled_shape, dtype = torch.half, device = device)
++        # On a growable parent (quant, EXL3_KV_GROW) the planes join its page-mapped ranges
++        if hasattr(self, "alloc_pool"):
++            self.alloc_pool(device, "raw_k", self.raw_k_shape, torch.half)
++            self.alloc_pool(device, "pooled", self.pooled_shape, torch.half)
++        else:
++            self.raw_k = torch.zeros(self.raw_k_shape, dtype = torch.half, device = device)
++            self.pooled = torch.zeros(self.pooled_shape, dtype = torch.half, device = device)
+ 
+     @override
+     def free(self):
+diff --git a/exllamav3/cache/quant.py b/exllamav3/cache/quant.py
+index af510d5b..1c2e97d2 100644
+--- a/exllamav3/cache/quant.py
++++ b/exllamav3/cache/quant.py
+@@ -4,13 +4,14 @@ import torch
+ from ..constants import PAGE_SIZE
+ from ..model import Config
+ from .cache import CacheLayer
++from .grow import GrowablePool
+ from typing import TYPE_CHECKING
+ from exllamav3.ext import exllamav3_ext as ext
+ if TYPE_CHECKING:
+     from ..modules import Attention
+ import numpy as np
+ 
+-class CacheLayer_quant(CacheLayer):
++class CacheLayer_quant(GrowablePool, CacheLayer):
+ 
+     def __init__(
+         self,
+@@ -51,10 +52,13 @@ class CacheLayer_quant(CacheLayer):
+     @override
+     def alloc(self, device: torch.device):
+         self.device = device
+-        self.qk = torch.zeros(self.qshape_k, dtype = torch.int, device = device) if self.shape else None
+-        self.qv = torch.zeros(self.qshape_v, dtype = torch.int, device = device) if self.shape else None
+-        self.sk = torch.zeros(self.qshape_s, dtype = torch.half, device = device) if self.shape else None
+-        self.sv = torch.zeros(self.qshape_s, dtype = torch.half, device = device) if self.shape else None
++        if self.shape:
++            self.alloc_pool(device, "qk", self.qshape_k, torch.int)
++            self.alloc_pool(device, "qv", self.qshape_v, torch.int)
++            self.alloc_pool(device, "sk", self.qshape_s, torch.half)
++            self.alloc_pool(device, "sv", self.qshape_s, torch.half)
++        else:
++            self.qk = self.qv = self.sk = self.sv = None
+ 
+ 
+     @override
+@@ -64,6 +68,7 @@ class CacheLayer_quant(CacheLayer):
+         self.qv = None
+         self.sk = None
+         self.sv = None
++        self.free_pools()
+ 
+ 
+     def get_qkv(self):
+diff --git a/exllamav3/cache/vmm.py b/exllamav3/cache/vmm.py
+new file mode 100644
+index 00000000..7a423a10
+--- /dev/null
++++ b/exllamav3/cache/vmm.py
+@@ -0,0 +1,72 @@
++"""Growable device ranges on CUDA virtual memory management (EXL3_KV_GROW).
++
++A VmmRange reserves address space for its maximum size once and maps physical memory in granules (2 MiB on SM120)
++only for the prefix in use. The base address never moves, so kernels and captured CUDA graphs that bake it stay
++valid as the range grows. Tensors are views of the full range; only the mapped prefix may be touched.
++
++The native part (cache/native/vmm_pool.cpp, outside exllamav3_ext so the main extension does not compile it) is a
++small JIT module, built on first use. Port of the growable KV cache of the QMesh exllamav3 fork.
++"""
++from __future__ import annotations
++
++import os
++import threading
++
++import torch
++
++_ext = None
++_ext_lock = threading.Lock()
++
++
++def ext():
++    global _ext
++    with _ext_lock:
++        if _ext is None:
++            from torch.utils.cpp_extension import load, CUDA_HOME
++            src = os.path.join(os.path.dirname(__file__), "native", "vmm_pool.cpp")
++            inc = [os.path.join(CUDA_HOME, "include")] if CUDA_HOME else []
++            _ext = load("exllamav3_vmm", [src], extra_include_paths = inc,
++                        extra_ldflags = ["-L/usr/lib/x86_64-linux-gnu", "-lcuda"], verbose = False)
++        return _ext
++
++
++class VmmRange:
++    """One reserved device range of `max_bytes`, physically backed for [0, mapped)."""
++
++    def __init__(self, device: torch.device, max_bytes: int):
++        self.device = torch.device(device)
++        self.handle = ext().vmm_create(self.device.index or 0, int(max_bytes))
++        base, self.reserved, self.mapped, self.granule = ext().vmm_info(self.handle)
++        self.base = base
++        # torch.from_blob asks the runtime which device owns the base pointer, which fails for a range with nothing
++        # mapped: the first granule stays mapped for the range's lifetime
++        self.floor = self.granule
++        self.mapped = ext().vmm_grow(self.handle, self.floor)
++        ext().vmm_view(self.handle, self.floor).zero_()
++
++    def view(self, dtype: torch.dtype, shape: tuple) -> torch.Tensor:
++        n = 1
++        for s in shape:
++            n *= s
++        nbytes = n * torch.empty((), dtype = dtype).element_size()
++        assert nbytes <= self.reserved, f"VmmRange view {nbytes} B > reserved {self.reserved} B"
++        return ext().vmm_view(self.handle, nbytes).view(dtype).view(shape)
++
++    def ensure(self, nbytes: int) -> int:
++        """Map so that at least nbytes from the base are backed, zero-filled (preallocated pools are torch.zeros);
++        returns the bytes newly mapped. The fill is enqueued on the current stream, ahead of any use."""
++        before = self.mapped
++        if nbytes > self.mapped:
++            self.mapped = ext().vmm_grow(self.handle, int(nbytes))
++            ext().vmm_view(self.handle, self.mapped)[before:].zero_()
++        return self.mapped - before
++
++    def round_up(self, nbytes: int) -> int:
++        g = self.granule
++        return (nbytes + g - 1) // g * g
++
++    def free(self):
++        if self.handle:
++            ext().vmm_destroy(self.handle)
++            self.handle = 0
++            self.mapped = 0
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index 2c986392..8e825996 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -275,7 +275,7 @@ class Generator:
+         # Single-device runs only; multi-device and TP runs keep fixed chunks
+         self.prefill_chunk_limit = None
+         if PREFILL_ADAPTIVE and torch.cuda.is_available() and len(self.model.active_devices) == 1:
+-            self.prefill_chunk_limit = PrefillChunkLimiter(torch.device(self.model.active_devices[0]))
++            self.prefill_chunk_limit = PrefillChunkLimiter(torch.device(self.model.active_devices[0]), cache)
+ 
+         # Prompt ingestion alongside generating jobs, see iterate()
+         if shared_chunk_size is None:
+diff --git a/exllamav3/generator/pagetable.py b/exllamav3/generator/pagetable.py
+index 7fb9061d..8c03b848 100644
+--- a/exllamav3/generator/pagetable.py
++++ b/exllamav3/generator/pagetable.py
+@@ -370,6 +370,13 @@ class PageTable:
+             "alloc_kv_only_pages": 0,     # cached KV pages not resumable because no recurrent stash covers them
+         }
+ 
++        # Growable pool (EXL3_KV_GROW): physical pages are mapped up to the highest page index handed out. The
++        # eviction order prefers backed pages (any unreferenced backed page before the lowest unbacked one), so
++        # the mapped prefix only grows when every backed page is in use or worth keeping as prompt cache less than
++        # EXL3_KV_GROW_KEEP_CACHE allows
++        self.growable = cache.growable()
++        self.metrics.update(grow_pages = 0)
++
+ 
+     def reset_page_table(self):
+         """
+@@ -446,12 +453,19 @@ class PageTable:
+         order = []
+         emitted = set()
+ 
+-        # Class 1: empty pages
++        # Class 1: empty pages. On a growable pool: backed empty pages first, then unbacked ones lowest index first
++        # (each extends the mapped prefix by one page), so the mapped prefix stays compact and cached prompt pages
++        # are only evicted once the whole pool is mapped
+         empty = [
+             p for p in self.unreferenced_pages.values()
+             if p.kv_position == 0 and p.phash not in protected_hashes
+         ]
+-        empty.sort(key = lambda p: p.access_serial)
++        if self.growable:
++            backed = self.cache.backed_pages()
++            empty.sort(key = lambda p: (p.page_index >= backed, p.page_index if p.page_index >= backed else 0,
++                                        p.access_serial))
++        else:
++            empty.sort(key = lambda p: p.access_serial)
+         for p in empty:
+             order.append(p)
+             emitted.add(id(p))
+@@ -520,6 +534,22 @@ class PageTable:
+         return deque(order)
+ 
+ 
++    def _back(self, page: CachePage):
++        """Growable pool: map physical memory up to and including this page before anything writes it. Pages are
++        taken between forwards, when prefill scratch sits in torch's cache: if mapping fails, that cache goes back
++        to the device and the mapping is retried"""
++        if not self.growable or page.page_index < self.cache.backed_pages():
++            return
++        before = self.cache.backed_pages()
++        try:
++            self.cache.ensure_pages(page.page_index + 1)
++        except RuntimeError:
++            torch.cuda.synchronize()
++            torch.cuda.empty_cache()
++            self.cache.ensure_pages(page.page_index + 1)
++        self.metrics["grow_pages"] += page.page_index + 1 - before
++
++
+     def evict(self, page: CachePage, protect: set | None = None):
+         """
+         An unreferenced page is about to be repurposed and its current identity destroyed. At this point
+@@ -610,6 +640,7 @@ class PageTable:
+                 # simply falls through to normal prefill.
+                 else:
+                     op = next_evictable()
++                    self._back(op)
+                     op.add_ref_clear(self.access_serial, h)
+                     tier = self.cpu_tier
+                     if tier is not None and (restore_limit is None or lp < restore_limit):
+@@ -636,6 +667,7 @@ class PageTable:
+         for npi in range(new_unique_pages):
+             self.access_serial += 1
+             op = next_evictable()
++            self._back(op)
+             op.add_ref_unique(self.access_serial)
+             # Link the first fresh page to a complete cached prefix. Normally the link is written when the
+             # preceding page completes during generation, but when a requeued job resumes on a fully cached
+@@ -862,7 +894,8 @@ class PageTable:
+ 
+     def defrag(self, debug = False):
+ 
+-        if not self.generator.enable_defrag:
++        # A growable pool keeps its pages compact by construction and must never copy into unbacked pages
++        if not self.generator.enable_defrag or self.growable:
+             return
+ 
+         # Defragment once job queue is empty and all pages have been touched at least once
+diff --git a/exllamav3/generator/prefill_limit.py b/exllamav3/generator/prefill_limit.py
+index c8da0d93..788eebbe 100644
+--- a/exllamav3/generator/prefill_limit.py
++++ b/exllamav3/generator/prefill_limit.py
+@@ -34,6 +34,12 @@ PREFILL_DEPTH_BASE = float(os.environ.get("EXL3_PREFILL_DEPTH_BASE_MIB", "256"))
+ PREFILL_DEPTH_BYTES = float(os.environ.get("EXL3_PREFILL_DEPTH_BYTES", "0"))
+ PREFILL_MARGIN_MIB = float(os.environ.get("EXL3_PREFILL_MARGIN_MIB", "1024"))
+ PREFILL_ADAPTIVE_LOG = os.environ.get("EXL3_PREFILL_ADAPTIVE_LOG", "0") == "1"
++# Growable KV pool (EXL3_KV_GROW=1): room = memory the device reports free (unmapped pool pages are free; torch's
++# cached blocks are released first and never counted), minus the margin and minus the pool growth decode can take
++# during the chunk. The chunk is the largest ladder step (planned, 8192, 4096, 2048, then pages) that fits.
++# EXL3_PREFILL_GROW_DECODE_MIB: growth reserve for decode traffic during one chunk
++PREFILL_GROW_DECODE_BYTES = float(os.environ.get("EXL3_PREFILL_GROW_DECODE_MIB", "256")) * 2 ** 20
++PREFILL_LADDER = (8192, 4096, 2048)
+ PREFILL_ADAPTIVE_EMPTY_CACHE = os.environ.get("EXL3_PREFILL_ADAPTIVE_EMPTY_CACHE", "0") == "1"
+ 
+ 
+@@ -62,8 +68,9 @@ class PrefillChunkLimiter:
+     """One free-memory read and one solve per prefill chunk: the largest page-aligned chunk that fits, at most
+     the planned chunk and at least one page"""
+ 
+-    def __init__(self, device):
++    def __init__(self, device, cache = None):
+         self.device = device
++        self.cache = cache if cache is not None and cache.growable() else None
+         self.prev = None
+         self.chunks = 0
+         self.shrunk = 0
+@@ -78,6 +85,8 @@ class PrefillChunkLimiter:
+             _log(f"PREFILL_CHUNK_PEAK start={p_start} rows={p_rows} rise_MiB={(peak - p_alloc) / 2**20:.0f} "
+                  f"predicted_MiB={prefill_rise(p_start, p_rows) / 2**20:.0f} ms={dt * 1e3:.0f}")
+         torch.cuda.reset_peak_memory_stats(dev)
++        if self.cache is not None:
++            return self._grow_call(start, chunk, alloc)
+         # Torch's held-but-free blocks count as usable (expandable segments let a freed block serve any shape);
+         # the margin stays free on the card
+         free, _ = torch.cuda.mem_get_info(dev)
+@@ -109,6 +118,33 @@ class PrefillChunkLimiter:
+         self.prev = (start, rows, alloc, time.perf_counter())
+         return rows
+ 
++    def _grow_call(self, start: int, chunk: int, alloc: int) -> int:
++        dev = self.device
++        # Prefill scratch from the previous chunk lives in torch's cache: hand it back to the device so the pool's
++        # page mapping and this chunk draw from the same free memory, and count only what the device reports free
++        torch.cuda.empty_cache()
++        free, total = torch.cuda.mem_get_info(dev)
++        room = free - PREFILL_MARGIN_MIB * 2 ** 20 - PREFILL_GROW_DECODE_BYTES
++        fit = int(prefill_fit(start, room)) // PAGE_SIZE * PAGE_SIZE
++        rows = None
++        for step in (chunk,) + tuple(s for s in PREFILL_LADDER if s < chunk):
++            if step <= fit:
++                rows = step
++                break
++        if rows is None:
++            rows = max(PAGE_SIZE, min(chunk, fit))
++        self.chunks += 1
++        if rows < chunk:
++            self.shrunk += 1
++        if PREFILL_ADAPTIVE_LOG:
++            c = self.cache
++            _log(f"PREFILL_CHUNK_ADAPT grow start={start} planned={chunk} rows={rows} room_MiB={room / 2**20:.0f} "
++                 f"free_MiB={free / 2**20:.0f} alloc_MiB={alloc / 2**20:.0f} "
++                 f"reserved_MiB={torch.cuda.memory_reserved(dev) / 2**20:.0f} "
++                 f"pool_backed_pages={c.backed_pages()} pool_unmapped_MiB={c.unmapped_bytes() / 2**20:.0f}")
++        self.prev = (start, rows, alloc, time.perf_counter())
++        return rows
++
+     def prefill_done(self):
+         """A prompt's prefill finished: log the last chunk's rise, then return torch's held-but-free blocks to
+         the card so decode-time graph captures (separate pool) find free memory after a large-chunk prefill"""
+diff --git a/exllamav3/modules/attn.py b/exllamav3/modules/attn.py
+index 0da0f945..68d99c6c 100644
+--- a/exllamav3/modules/attn.py
++++ b/exllamav3/modules/attn.py
+@@ -108,6 +108,8 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+         # assert (past_len is not None) ^ (cache_seqlens is not None), "Need either past_len or cache_seqlens"
+         assert bsz * cache_max_seq_len <= cache.max_num_tokens, "Cache too small for batch shape"
+         cache_bsz = min(bsz, cache_bsz)
++        if cache.growable():
++            cache.ensure_pages(cache_bsz * cache_max_seq_len // PAGE_SIZE)
+         block_table = _get_block_table(cache_bsz, cache_max_seq_len // PAGE_SIZE)
+         if past_len is not None:
+             cache_seqlens = torch.tensor([past_len], dtype = torch.int32).repeat(bsz)
+-- 
+2.43.0
+
