@@ -1,3 +1,15 @@
 __pycache__/
 *.pyc
 .venv/
+notes/
+logs/
+*.ledger.md
+RESTORE*.md
+*Ledger*.md
+*prod*.txt
+*.sqlite
+*.sqlite3
+.env
+.env.*
+*.pem
+*.key
