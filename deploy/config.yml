@@ -21,7 +21,7 @@ model:
   tensor_parallel: false
   gpu_split_auto: false
   gpu_split: [99]
-  max_batch_size: 8
+  max_batch_size: 9           # 9th slot: +148 MiB; a new prompt does not wait for 8 long decodes
   chunk_size: 8192            # 16384 runs out of memory at this pool
   ngram_ram: false            # engram table read from disk; EXL3_NGRAM_LOCK=1 pins it in RAM instead
   vision: true
@@ -32,7 +32,7 @@ draft_model:
   draft_mode: model
   draft_model_dir: /path/to/drafts
   draft_model_name: Qwen3.8-Flash-Next-DFlash2
-  draft_num_tokens: 7         # DFlash2 block 8 -> 7 drafts; 8 drafts leave the MAX_BSZN=8 fused path
+  draft_num_tokens: 7         # DFlash2 block of 8 = anchor + 7 drafts
   dynamic_draft: true
   draft_confidence: 0.45
 

@@ -1,6 +1,6 @@
 TabbyAPI prefill_chunk_size, prefill_cooldown and shared_chunk_size settings, for theroyallab/tabbyAPI 564f8fb.
 License: AGPL-3.0 (this patch modifies AGPL-3.0-licensed TabbyAPI; it is not covered by this repo's MIT license).
-Apply with: git apply tabbyapi-prefill-chunk-size.patch.v3 (instead of tabbyapi-prefill-chunk-size.patch)
+Apply with: git apply tabbyapi-v3.patch (instead of tabbyapi-prefill-chunk-size.patch)
 
 diff --git a/backends/exllamav3/model.py b/backends/exllamav3/model.py
 index 51c7352..ed4da94 100644
