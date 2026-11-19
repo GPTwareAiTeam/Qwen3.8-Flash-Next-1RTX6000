@@ -1,0 +1,66 @@
+From ad2e02eb36181624b2e572b5e9f8c6068f955f2f Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:45:32 -0500
+Subject: [PATCH 16/18] GatedResidual: resident int8 tables for the tiled mix
+ (EXL3_HC_TABLE_CACHE, default off)
+
+The tiled path (more than FUSED_MAX_R rows: wide verify windows, prefill) derived its int8 hi/lo tables from the
+fp16 tables on every call. With EXL3_HC_TABLE_CACHE=1 they are built once at load: the same deterministic split,
+bit-identical outputs, about 14.5 MB per site (1.3 GiB on Qwen3.8-Flash-Next).
+---
+ exllamav3/modules/hyperconnections.py | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/exllamav3/modules/hyperconnections.py b/exllamav3/modules/hyperconnections.py
+index 2e301eb1..a9389b99 100644
+--- a/exllamav3/modules/hyperconnections.py
++++ b/exllamav3/modules/hyperconnections.py
+@@ -15,6 +15,11 @@ import math
+ # TP, see hc_mix_tiled.cu); 0 falls back to the cuBLAS GEMM path
+ _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
+ 
++# EXL3_HC_TABLE_CACHE=1: build the tiled path's int8 hi/lo tables (+ scales) once at load and keep them resident
++# instead of re-deriving them from the fp16 tables on every R > FUSED_MAX_R mix. Same deterministic split, so the
++# bytes and the outputs are identical; costs ~14.6 MB per site (~1.4 GB on Qwen3.8-Flash-Next's 97 sites)
++_hc_table_cache = os.environ.get("EXL3_HC_TABLE_CACHE", "0") != "0"
++
+ # Decode row counts: launch-count folds for the mHC sites (hc_mix_fused, hc_fuse.cuh). apply_ defers its
+ # residual update into the next site's mix, and the RMSNorm a block runs after a mix executes inside its
+ # finalize. Bit-identical to the unfused launches; EXL3_HC_FOLD selects (per-backend default in util/backend.py)
+@@ -369,6 +374,7 @@ class GatedResidual(Module):
+         self.proj_m = 0             # rows of proj_h in use: rank (+ hc_mult in the site form)
+         self.rank = 0
+         self.tiled = False          # prefill mixes take the tiled deterministic kernel
++        self.tiled_tables = None    # resident int8 tables of the tiled path (EXL3_HC_TABLE_CACHE)
+         self.next_site = None       # GatedResidual whose mix follows this site's apply_ (link_sites)
+ 
+     @override
+@@ -426,12 +432,16 @@ class GatedResidual(Module):
+             # Every inference consumer reads proj_h directly or the repacked up (the tiled path
+             # derives its int8 tables per call, _tiled_tables): release the checkpoint-layout up
+             self.up_h = None
++        self.tiled_tables = None
++        if self.tiled and _hc_table_cache:
++            self.tiled_tables = self._tiled_tables(lambda shape, dtype: torch.empty(shape, dtype = dtype, device = dev))
+ 
+     @override
+     def unload(self):
+         super().unload()
+         self.norm_w_raw = self.norm_w = self.w_h = None
+         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = None
++        self.tiled_tables = None
+ 
+     @override
+     def get_tensors(self):
+@@ -568,7 +578,7 @@ class GatedResidual(Module):
+                 buf = torch.empty((1 << (numel - 1).bit_length(),), dtype = dtype, device = dev)
+                 return buf[: numel].view(shape)
+             Mpad = self.proj_h.shape[0]
+-            proj_i8, proj_sb, up_i8, up_sb = self._tiled_tables(ws)
++            proj_i8, proj_sb, up_i8, up_sb = self.tiled_tables or self._tiled_tables(ws)
+             S = ext.gr_mix_tiled_slices(R, Dh, Mpad)
+             Rpad = -(-R // 64) * 64
+             post = ws((R, H), torch.float) if self.use_combine else None
+-- 
+2.43.0
+

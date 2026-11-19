@@ -1,0 +1,434 @@
+From a5155d9ddbb18430bcd8449b9cdde0a92d87da9a Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:45:57 -0500
+Subject: [PATCH 18/18] Generator: batched speculative accept
+ (EXL3_SD_BATCH_ACCEPT, default off)
+
+Multi-user verify rounds accepted job by job: each job's window samplers launched and read back on their own, then
+two rewind launch sets per job (conv copy-back, scan replay) with ~10 us of Python per layer and job. With
+EXL3_SD_BATCH_ACCEPT=1 every batchable job's window samplers launch before any is accepted and one synchronize covers
+the round; the target-side GDN rewinds of the round are deferred and settled together (GDNState.rewind_many ->
+batched_rewind_flat: descriptor arrays built with numpy, the same two kernels). Per-job RNG draws, acceptance order and
+the settled states are those of the serial loop.
+
+Also: CustomSampler set reqs_past_ids from every step before alt() dropped the identity ones; TabbyAPI adds
+repetition 1.0 / presence 0 / frequency 0 steps to every stack, so every sampler claimed to read past ids and the
+batched readback port (EXL3_SD_BATCH_READBACK) never engaged. Under EXL3_SD_BATCH_ACCEPT the flag comes from the
+steps that survive simplification.
+---
+ exllamav3/exllamav3_ext/bindings.cpp  |   3 +
+ exllamav3/exllamav3_ext/gdn.cu        |  36 +++++++++
+ exllamav3/exllamav3_ext/gdn.cuh       |  17 +++++
+ exllamav3/generator/generator.py      | 104 ++++++++++++++++++--------
+ exllamav3/generator/sampler/custom.py |  10 +++
+ exllamav3/modules/gated_delta_net.py  | 104 +++++++++++++++++++++++++-
+ 6 files changed, 242 insertions(+), 32 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index e3c4c0da..ea0e8734 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -280,6 +280,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("batched_scan_replay", &batched_scan_replay, py::arg("jobs"), py::arg("device_index"), py::arg("kind"),
+           py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("k_head_dim"), py::arg("v_head_dim"),
+           py::arg("state_half") = false);
++    m.def("batched_rewind_flat", &batched_rewind_flat, py::arg("conv_desc"), py::arg("replay_desc"), py::arg("device_index"),
++          py::arg("kind"), py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("k_head_dim"), py::arg("v_head_dim"),
++          py::arg("state_half"));
+ 
+     m.def("argmax_sample", &argmax_sample, "argmax_sample");
+     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
+diff --git a/exllamav3/exllamav3_ext/gdn.cu b/exllamav3/exllamav3_ext/gdn.cu
+index fca6d9b8..31238c80 100644
+--- a/exllamav3/exllamav3_ext/gdn.cu
++++ b/exllamav3/exllamav3_ext/gdn.cu
+@@ -2321,3 +2321,39 @@ void batched_scan_replay
+         cuda_check(cudaPeekAtLastError());
+     }
+ }
++
++void batched_rewind_flat
++(
++    const at::Tensor& conv_desc,
++    const at::Tensor& replay_desc,
++    int device_index,
++    int kind,
++    int num_k_heads,
++    int num_v_heads,
++    int k_head_dim,
++    int v_head_dim,
++    bool state_half
++)
++{
++    TORCH_CHECK(conv_desc.device().is_cpu() && conv_desc.dtype() == at::kLong && conv_desc.dim() == 2 && conv_desc.size(1) == 5,
++                "batched_rewind_flat: conv_desc must be CPU int64 [n, 5]");
++    TORCH_CHECK(replay_desc.device().is_cpu() && replay_desc.dtype() == at::kLong && replay_desc.dim() == 2 && replay_desc.size(1) == 8,
++                "batched_rewind_flat: replay_desc must be CPU int64 [m, 8]");
++    at::Tensor cd = conv_desc.contiguous();
++    at::Tensor rd = replay_desc.contiguous();
++    const int64_t* c = cd.data_ptr<int64_t>();
++    const int64_t* r = rd.data_ptr<int64_t>();
++
++    std::vector<ConvRewindJob> conv_jobs;
++    conv_jobs.reserve(cd.size(0));
++    for (int64_t i = 0; i < cd.size(0); ++i, c += 5)
++        conv_jobs.emplace_back((uintptr_t) c[0], (uintptr_t) c[1], (int) c[2], (int) c[3], (int) c[4]);
++    batched_conv_rewind(conv_jobs, device_index);
++
++    std::vector<ScanReplayJob> replay_jobs;
++    replay_jobs.reserve(rd.size(0));
++    for (int64_t i = 0; i < rd.size(0); ++i, r += 8)
++        replay_jobs.emplace_back((uintptr_t) r[0], (uintptr_t) r[1], (uintptr_t) r[2], (uintptr_t) r[3], (uintptr_t) r[4],
++                                 (uintptr_t) r[5], (int) r[6], (int) r[7]);
++    batched_scan_replay(replay_jobs, device_index, kind, num_k_heads, num_v_heads, k_head_dim, v_head_dim, state_half);
++}
+diff --git a/exllamav3/exllamav3_ext/gdn.cuh b/exllamav3/exllamav3_ext/gdn.cuh
+index 832b72c5..b867f31d 100644
+--- a/exllamav3/exllamav3_ext/gdn.cuh
++++ b/exllamav3/exllamav3_ext/gdn.cuh
+@@ -276,3 +276,20 @@ void batched_scan_replay
+     int v_head_dim,
+     bool state_half = false     // the jobs' state rows hold fp16 elements (see state_ld in gdn.cu)
+ );
++
++// Rewind of many sequences at once (generator EXL3_SD_BATCH_ACCEPT): the same two kernels over descriptors built
++// host-side in bulk. conv_desc: CPU int64 [n, 5] = ConvRewindJob fields; replay_desc: CPU int64 [m, 8] =
++// ScanReplayJob fields (every replay job shares the given geometry). Jobs touch disjoint slot rows, so their split
++// into launches does not change any result
++void batched_rewind_flat
++(
++    const at::Tensor& conv_desc,
++    const at::Tensor& replay_desc,
++    int device_index,
++    int kind,
++    int num_k_heads,
++    int num_v_heads,
++    int k_head_dim,
++    int v_head_dim,
++    bool state_half
++);
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index 198d7f1d..57c5b844 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -39,6 +39,12 @@ _SD_BATCH_READBACK = os.environ.get("EXL3_SD_BATCH_READBACK", "0") == "1"
+ # the logits (window_batch_safe: the fused greedy kernel) samples the whole window in one launch.
+ # EXL3_SD_WINDOW_BATCH=1 enables (default off, for A/B)
+ _SD_WINDOW_BATCH = os.environ.get("EXL3_SD_WINDOW_BATCH", "0") == "1"
++# Batched speculative accept (EXL3_SD_BATCH_ACCEPT=1): every batchable job's window samplers launch before any job is
++# accepted, all windows read back through one synchronize per round (not one per job), and the target-side
++# recurrent rewinds of the round are deferred and settled in one batch (GDNState.rewind_many). Per-job RNG draws,
++# acceptance order and the settled states are those of the serial loop. Implies the batched readback for the jobs
++# it covers; default off, for A/B
++_SD_BATCH_ACCEPT = os.environ.get("EXL3_SD_BATCH_ACCEPT", "0") == "1"
+ 
+ 
+ def _window_batchable(job, W):
+@@ -1621,9 +1627,13 @@ class Generator:
+         rewound_jobs = set()
+         j = 0
+ 
++        # Target-side recurrent rewinds deferred to the end of the accept loop (EXL3_SD_BATCH_ACCEPT; jobs whose
++        # windows were staged up front only: nothing in their accept path reads the state before it is settled)
++        pending_rewinds = None
++
+         # Reject the trailing draft positions after the last accepted token at index i: count them, roll back the
+         # job's recurrent state and return cache pages to the accepted position
+-        def reject_remainder(job_, j_, i_, batch_states_):
++        def reject_remainder(job_, j_, i_, batch_states_, defer = False):
+             num_rejected = batch_logits.shape[1] - 1 - i_
+             if num_rejected == 0:
+                 return 0
+@@ -1631,7 +1641,10 @@ class Generator:
+ 
+             # Rewind recurrent states
+             if batch_states_ is not None:
+-                batch_states_[j_].rewind(num_rejected)
++                if defer:
++                    pending_rewinds.append((batch_states_[j_], num_rejected))
++                else:
++                    batch_states_[j_].rewind(num_rejected)
+ 
+             # Rewind cache position (draft model cache layout is always the same as target)
+             for seq_ in job_.sequences:
+@@ -1701,35 +1714,54 @@ class Generator:
+         # position n gates position n+1, and constrained-decoding masks and sampling past IDs
+         # must advance between positions.
+         else:
++            W = batch_logits.shape[1]
++
++            # Launch a job's window samplers up front into its pinned row (row j: receive_sample may keep
++            # references to earlier jobs' tokens); the caller synchronizes before the tokens are read
++            def stage_window(job, job_logits, j):
++                rng_state = job.rng.getstate()
++                pinned_all = getattr(self, "draft_sample_pinned", None)
++                if pinned_all is None or pinned_all.shape[0] <= j or pinned_all.shape[1] < W:
++                    pinned_all = torch.empty((max(self.max_batch_size, j + 1), max(W, 16)), dtype = torch.long,
++                                             pin_memory = True)
++                    self.draft_sample_pinned = pinned_all
++                pinned_w = pinned_all[j:j + 1]
++                if (_SD_WINDOW_BATCH and W > 1 and getattr(job.sampler, "window_batch_safe", False)
++                        and not job.return_probs and not job.return_top_tokens):
++                    tok_w = job.receive_logits(job_logits)[0]
++                    pinned_w[:, :W].copy_(tok_w.view(1, W), non_blocking = True)
++                    return [(pinned_w[:, i:i + 1], None, None, None) for i in range(W)], 1, rng_state
++                staged = []
++                for i in range(W):
++                    s = job.receive_logits(job_logits[:, i:i + 1, :])
++                    pinned_w[:, i:i + 1].copy_(s[0].view(1, 1), non_blocking = True)
++                    staged.append((pinned_w[:, i:i + 1],) + tuple(s[1:]))
++                return staged, W, rng_state
++
++            # Batched accept: every batchable job's samplers launch first, one synchronize covers the round
++            prestaged = {}
++            if _SD_BATCH_ACCEPT and draft_tokens is not None:
++                pending_rewinds = []
++                jj = 0
++                for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
++                    if a == b: continue
++                    if b - a == 1 and _window_batchable(job, W):
++                        prestaged[jj] = stage_window(job, batch_logits[a:b, :, :], jj)
++                    jj += 1
++                if prestaged:
++                    torch.cuda.synchronize(batch_logits.device)
++
+             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+                 if a == b: continue
+                 job_logits = batch_logits[a:b, :, :]
+                 accepted_length = 1
+                 rejected = 0
+-                W = batch_logits.shape[1]
+                 staged = None
+-                if _SD_BATCH_READBACK and draft_tokens is not None and b - a == 1 and _window_batchable(job, W):
+-                    rng_state = job.rng.getstate()
+-                    # one pinned row per job of the round: receive_sample may keep references to earlier jobs' tokens
+-                    pinned_all = getattr(self, "draft_sample_pinned", None)
+-                    if pinned_all is None or pinned_all.shape[0] <= j or pinned_all.shape[1] < W:
+-                        pinned_all = torch.empty((max(self.max_batch_size, j + 1), max(W, 16)), dtype = torch.long,
+-                                                 pin_memory = True)
+-                        self.draft_sample_pinned = pinned_all
+-                    pinned_w = pinned_all[j:j + 1]
+-                    if (_SD_WINDOW_BATCH and W > 1 and getattr(job.sampler, "window_batch_safe", False)
+-                            and not job.return_probs and not job.return_top_tokens):
+-                        tok_w = job.receive_logits(job_logits)[0]
+-                        pinned_w[:, :W].copy_(tok_w.view(1, W), non_blocking = True)
+-                        staged = [(pinned_w[:, i:i + 1], None, None, None) for i in range(W)]
+-                        draws = 1
+-                    else:
+-                        staged = []
+-                        draws = W
+-                        for i in range(W):
+-                            s = job.receive_logits(job_logits[:, i:i + 1, :])
+-                            pinned_w[:, i:i + 1].copy_(s[0].view(1, 1), non_blocking = True)
+-                            staged.append((pinned_w[:, i:i + 1],) + tuple(s[1:]))
++                batched = j in prestaged
++                if batched:
++                    staged, draws, rng_state = prestaged[j]
++                elif _SD_BATCH_READBACK and draft_tokens is not None and b - a == 1 and _window_batchable(job, W):
++                    staged, draws, rng_state = stage_window(job, job_logits, j)
+                     torch.cuda.synchronize(batch_logits.device)
+                 positions_used = 0
+ 
+@@ -1797,7 +1829,7 @@ class Generator:
+                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
+                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+                         if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
+-                            rejected = reject_remainder(job, j, i, batch_states)
++                            rejected = reject_remainder(job, j, i, batch_states, defer = batched)
+                             break
+ 
+                         # Accept draft token
+@@ -1817,9 +1849,12 @@ class Generator:
+                                     job.logit_masks.append(f.get_next_logit_mask())
+                                     job.filter_futures.append(None)
+ 
+-                            # Update masks and past IDs
+-                            job.prepare_logit_mask()
+-                            job.prepare_sampling_past_ids()
++                            # Update masks and past IDs. A batched window has no filters and a mask constant over
++                            # the window (_window_batchable), and the next round prepares both again before it
++                            # samples, so nothing reads them in between
++                            if not batched:
++                                job.prepare_logit_mask()
++                                job.prepare_sampling_past_ids()
+ 
+                 if staged is not None and draws != positions_used:
+                     # The serial loop draws one sampler seed per position it reaches; the staged pass drew `draws`.
+@@ -1830,7 +1865,10 @@ class Generator:
+ 
+                 # Make sure outgoing state is valid if entire draft was accepted
+                 if batch_states and draft_tokens is not None and rejected == 0:
+-                    batch_states[j].rewind(0)
++                    if batched:
++                        pending_rewinds.append((batch_states[j], 0))
++                    else:
++                        batch_states[j].rewind(0)
+ 
+                 # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
+                 # checkpoint-boundary truncations are rare enough to count as ordinary rejections.
+@@ -1848,6 +1886,12 @@ class Generator:
+                 accepted_lengths.append(accepted_length)
+                 j += 1
+ 
++            # Settle the deferred target-side rewinds of the round in one batch (before anything reads the states:
++            # the drafter update below reads target hidden states only, the requeue stash comes later)
++            if pending_rewinds:
++                from ..modules.gated_delta_net import GDNState
++                GDNState.rewind_many(pending_rewinds)
++
+         # Update the draft-confidence calibration with this round's verification outcomes (any
+         # draft-model mode)
+         if self.draft_calibrator is not None and self._draft_conf_round is not None:
+diff --git a/exllamav3/generator/sampler/custom.py b/exllamav3/generator/sampler/custom.py
+index ebbab016..eb6f19f5 100644
+--- a/exllamav3/generator/sampler/custom.py
++++ b/exllamav3/generator/sampler/custom.py
+@@ -17,6 +17,9 @@ import torch.nn.functional as F
+ # Collapse eligible sampler stacks into the fused kernel path; EXL3_FUSED_SAMPLER=0 keeps the
+ # original step-by-step implementation (for testing/validation)
+ fused_sampler_enable = os.environ.get("EXL3_FUSED_SAMPLER", "1") != "0"
++# EXL3_SD_BATCH_ACCEPT=1: a sampler reads past ids only if a step that survives simplification needs them (see
++# CustomSampler.__init__)
++_sd_batch_accept = os.environ.get("EXL3_SD_BATCH_ACCEPT", "0") != "0"
+ 
+ class SS(Enum):
+     INIT = 0  # only state.in_logits is valid
+@@ -1183,6 +1186,13 @@ class CustomSampler(Sampler):
+                         self.steps.append(prep_step())
+                 self.steps.append(step)
+ 
++        # Identity penalty steps (rep 1.0, presence/frequency 0; TabbyAPI adds them to every stack) are dropped
++        # above but still flagged the sampler as reading past ids: a pinned stage + host-to-device copy per
++        # sampled position, and every speculative window disqualified from batched readback. With
++        # EXL3_SD_BATCH_ACCEPT=1 only the kept steps decide
++        if _sd_batch_accept:
++            self.reqs_past_ids = any(s.reqs_past_ids() for s in self.steps)
++
+         # Stateful steps carry state across calls (Adaptive-P's running average), so their positions cannot be
+         # sampled ahead of acceptance. A lone fused greedy step is a row-wise argmax: sampling a [W, V] window in
+         # one launch gives each row the token the per-position calls give (generator EXL3_SD_WINDOW_BATCH)
+diff --git a/exllamav3/modules/gated_delta_net.py b/exllamav3/modules/gated_delta_net.py
+index 1c372417..0f4d49f2 100644
+--- a/exllamav3/modules/gated_delta_net.py
++++ b/exllamav3/modules/gated_delta_net.py
+@@ -190,8 +190,13 @@ class GDNState:
+                 _rewind_layers(self.cache.get_all_recurrent_layers().values(), *args)
+             else:
+                 self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache),) + args)
+-            # The scratch row now holds the committed state: the whole pass, or the replayed
+-            # accepted prefix. It becomes the base row
++        self._settle(num_tokens)
++
++
++    def _settle(self, num_tokens: int):
++        # After a pass with history the scratch row holds the committed state (the whole pass, or
++        # the replayed accepted prefix) and becomes the base row
++        if self.last_history > 0:
+             self.parity = 1 - self.parity
+         self.position -= num_tokens
+         self.last_history = 0
+@@ -199,6 +204,101 @@ class GDNState:
+         self.spec_shape = None
+ 
+ 
++    @staticmethod
++    def rewind_many(pending: list):
++        """rewind() of several states at once: pending is a list of (state, num_tokens). The GDN
++        layer jobs of every state (one conv copy per layer, one scan replay per layer when tokens
++        were rejected) are built as two descriptor arrays and run through batched_rewind_flat, a
++        few launches for the whole batch instead of two per state plus ~10 us of Python per layer
++        and state. Same kernels on the same descriptors; states own disjoint pool rows, so the
++        grouping into launches changes no result. Tensor-parallel caches and states of other
++        types take the per-state path"""
++        import numpy as np
++        groups = {}
++        for state, n in pending:
++            if not isinstance(state, GDNState) or state.cache.model.loaded_tp or state.last_history == 0:
++                state.rewind(n)
++                continue
++            assert 0 <= n <= state.last_history, \
++                f"GDN rewind: {n} tokens outside the recorded history of {state.last_history}"
++            groups.setdefault(id(state.cache), (state.cache, []))[1].append((state, n))
++
++        for cache, items in groups.values():
++            layers = list(cache.get_all_recurrent_layers().values())
++            gdn = [l for l in layers if isinstance(l, GDNLayerState)]
++            other = [l for l in layers if not isinstance(l, GDNLayerState)]
++            for state, n in items:
++                for l in other:
++                    l.rewind(state.slot, state.last_history, n)
++
++            # Per-layer constants (byte addresses and strides); per-state offsets are added below
++            by_key = {}
++            for l in gdn:
++                key = (torch.device(l.device).index,) + l.scan_geometry()
++                by_key.setdefault(key, []).append(l)
++            for key, ls in by_key.items():
++                device_index = key[0]
++                cs0 = ls[0].conv_state
++                es = cs0.element_size()
++                cdim = ls[0].module.conv_kernel_size
++                assert all(l.conv_state.shape == cs0.shape and l.conv_state.stride() == cs0.stride()
++                           and l.module.conv_kernel_size == cdim for l in ls), "GDN rewind_many: mixed conv layouts"
++                conv_base = np.array([l.conv_state.data_ptr() for l in ls], dtype = np.int64)
++                cs_stride0 = cs0.stride(0) * es
++                cs_stride2 = cs0.stride(2) * es
++                cs_len = cs0.shape[-1]
++                rs0, sc0, sg0, sb0 = ls[0].recurrent_state, ls[0].spec_conv, ls[0].spec_g, ls[0].spec_beta
++                rs_base = np.array([l.recurrent_state.data_ptr() for l in ls], dtype = np.int64)
++                sc_base = np.array([l.spec_conv.data_ptr() for l in ls], dtype = np.int64)
++                sg_base = np.array([l.spec_g.data_ptr() for l in ls], dtype = np.int64)
++                sb_base = np.array([l.spec_beta.data_ptr() for l in ls], dtype = np.int64)
++                d_ptr = np.array([getattr(l.module, "d_skip_f", None).data_ptr()
++                                  if getattr(l.module, "d_skip_f", None) is not None else 0 for l in ls], dtype = np.int64)
++                row_bytes = rs0.stride(0) * rs0.element_size()
++                sc_row = sc0.stride(0) * sc0.element_size()
++                sg_row = sg0.stride(0) * sg0.element_size()
++                sb_row = sb0.stride(0) * sb0.element_size()
++
++                conv_rows, replay_rows = [], []
++                for state, n in items:
++                    slot_off = state.slot * cs_stride0
++                    p = cs_len - n
++                    c = np.empty((len(ls), 5), dtype = np.int64)
++                    c[:, 0] = conv_base + slot_off + (p - cdim) * cs_stride2
++                    c[:, 1] = conv_base + slot_off
++                    c[:, 2] = cs0.shape[1]
++                    c[:, 3] = cdim
++                    c[:, 4] = cs0.stride(1)
++                    conv_rows.append(c)
++                    if n > 0:
++                        spec_shape = state.spec_shape
++                        assert spec_shape is not None and state.spec_row is not None, \
++                            "GDN rewind: history was recorded but the pass staged no scan inputs to replay"
++                        assert all(l.spec_shape == spec_shape for l in ls), \
++                            f"GDN replay: staged inputs do not match the pass shape {spec_shape}"
++                        bsz, seqlen, tstride = spec_shape
++                        prefix = state.last_history + 1 - n
++                        assert 1 <= prefix <= seqlen and 0 <= state.spec_row < bsz
++                        r0 = state.spec_row * seqlen if tstride == 1 else state.spec_row
++                        r = np.empty((len(ls), 8), dtype = np.int64)
++                        r[:, 0] = sc_base + r0 * sc_row
++                        r[:, 1] = sg_base + r0 * sg_row
++                        r[:, 2] = sb_base + r0 * sb_row
++                        r[:, 3] = rs_base + state.base_row() * row_bytes
++                        r[:, 4] = rs_base + state.scratch_row() * row_bytes
++                        r[:, 5] = d_ptr
++                        r[:, 6] = prefix
++                        r[:, 7] = tstride
++                        replay_rows.append(r)
++                conv_desc = torch.from_numpy(np.concatenate(conv_rows)) if conv_rows else torch.empty((0, 5), dtype = torch.long)
++                replay_desc = torch.from_numpy(np.concatenate(replay_rows)) if replay_rows else torch.empty((0, 8), dtype = torch.long)
++                kind, nk, nv, dk, dv, state_half = key[1:]
++                ext.batched_rewind_flat(conv_desc, replay_desc, device_index, kind, nk, nv, dk, dv, state_half)
++
++            for state, n in items:
++                state._settle(n)
++
++
+     def rollback_capacity(self):
+         # The state advances destructively; rewinding is only possible immediately after a forward pass that
+         # recorded per-token history (speculative decoding), never at an arbitrary later point
+-- 
+2.43.0
+

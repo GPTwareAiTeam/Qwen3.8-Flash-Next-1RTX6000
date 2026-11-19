@@ -1,0 +1,200 @@
+From 8d8a0f239d48b73ce1ec4c633ef54946f6adef2d Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 08:45:42 -0500
+Subject: [PATCH 17/18] MoE: shared expert of wide verify windows as one pass
+ (EXL3_MOE_SHARED_WIDE, default off)
+
+Verify windows wider than MAX_BSZN rows (multi-user rounds) ran the shared expert's 8-row graph once per 8-row
+piece: 8 gate/up + 8 down launches per layer at 64 rows. BC_GatedMLP::run_wide runs any row count as one ungraphed
+pass (one gate/up mgemm, the activation, one down GEMM). Not bit-identical to the pieces (one GEMM over all rows
+tiles differently: max |diff| 4e-5..2e-4 at 9-64 rows); top-1 and KL at the noise floor.
+---
+ exllamav3/exllamav3_ext/bindings.cpp          |  1 +
+ .../libtorch/blocksparse_mlp.cpp              | 21 ++++++++++
+ .../exllamav3_ext/libtorch/blocksparse_mlp.h  |  2 +
+ exllamav3/exllamav3_ext/libtorch/mlp.cpp      | 39 ++++++++++++++++++-
+ exllamav3/exllamav3_ext/libtorch/mlp.h        | 11 ++++++
+ exllamav3/exllamav3_ext/libtorch/mlp_bc.h     |  3 +-
+ 6 files changed, 74 insertions(+), 3 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index 2ee83929..e3c4c0da 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -230,6 +230,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+     m.def("exl3_dgemv_has", &exl3_dgemv_has, "exl3_dgemv_has");
+     m.def("exl3_dgemv_set_enabled", &exl3_dgemv_set_enabled, "exl3_dgemv_set_enabled");
+     m.def("exl3_moe_shared_side_set", &exl3_moe_shared_side_set, "exl3_moe_shared_side_set");
++    m.def("exl3_moe_shared_wide_set", &exl3_moe_shared_wide_set, "exl3_moe_shared_wide_set");
+     m.def("exl3_dgemv_splits_for", &exl3_dgemv_splits_for, "exl3_dgemv_splits_for");
+ #endif
+     m.def("rope", &rope, "rope");
+diff --git a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
+index fba04e4c..cba732a7 100644
+--- a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.cpp
+@@ -144,6 +144,15 @@ void BC_BlockSparseMLP::run_bszN
+ 
+ void BC_BlockSparseMLP::run_shared_pieces(const at::Tensor& y, int num_tokens)
+ {
++    // EXL3_MOE_SHARED_WIDE=1: a verify window wider than MAX_BSZN runs the shared expert as one ungraphed pass over
++    // all rows (one gate/up and one down launch) instead of one graph replay per MAX_BSZN-row piece
++    if (num_tokens > MAX_BSZN && sh_wide_enabled())
++    {
++        at::Tensor x_dense = y.slice(0, 0, num_tokens).unsqueeze(0);
++        at::Tensor out_n = out_d_sh.value().slice(1, 0, num_tokens);
++        shared_experts->run_wide(x_dense, out_n);
++        return;
++    }
+     // The shared expert's multi-row graph covers MAX_BSZN rows: wider verify windows run it in pieces
+     for (int start = 0; start < num_tokens; start += MAX_BSZN)
+     {
+@@ -154,6 +163,18 @@ void BC_BlockSparseMLP::run_shared_pieces(const at::Tensor& y, int num_tokens)
+     }
+ }
+ 
++// -1: the env (EXL3_MOE_SHARED_WIDE, default off); exl3_moe_shared_wide_set(0 / 1) overrides it (tests, benches)
++static int sh_wide_override = -1;
++
++void exl3_moe_shared_wide_set(int mode) { sh_wide_override = mode; }
++
++bool BC_BlockSparseMLP::sh_wide_enabled()
++{
++    if (sh_wide_override >= 0) return sh_wide_override != 0;
++    static const bool on = std::getenv("EXL3_MOE_SHARED_WIDE") && atoi(std::getenv("EXL3_MOE_SHARED_WIDE")) != 0;
++    return on;
++}
++
+ // -1: the env (EXL3_MOE_SHARED_SIDE, default off); exl3_moe_shared_side_set(0 / 1) overrides it (tests, benches)
+ static int sh_side_override = -1;
+ 
+diff --git a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.h b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.h
+index 0b0c43c4..8996aa76 100644
+--- a/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.h
++++ b/exllamav3/exllamav3_ext/libtorch/blocksparse_mlp.h
+@@ -22,6 +22,7 @@ std::tuple<at::Tensor, at::Tensor> blocksparse_mlp_routing(
+ );
+ 
+ void exl3_moe_shared_side_set(int mode);
++void exl3_moe_shared_wide_set(int mode);
+ 
+ struct BC_BlockSparseMLP
+ {
+@@ -101,6 +102,7 @@ struct BC_BlockSparseMLP
+     cudaEvent_t sh_fork = nullptr, sh_join = nullptr;
+     void run_shared_pieces(const at::Tensor& y, int num_tokens);
+     static bool sh_side_enabled();
++    static bool sh_wide_enabled();
+     static cudaStream_t sh_side_stream(int device);
+ 
+ #if defined(USE_ROCM)
+diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.cpp b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
+index 4e80c153..86e9a806 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mlp.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
+@@ -24,6 +24,12 @@ void BC_GatedMLP::run_bszN_gr
+     // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MAX_BSZN --
+     // use exactly-shaped, lazily-cached buffers instead (a/down_xh have no such issue: their slot
+     // dim is size 1, so slicing the token dim -- the true leading dim there -- stays contiguous)
++    // Widths past MAX_BSZN (run_wide) grow the caches and take lazily allocated, exactly-shaped activation scratch
++    if ((int) guh_cache.size() < num_tokens)
++    {
++        guh_cache.resize(num_tokens);
++        gu_cache.resize(num_tokens);
++    }
+     at::Tensor& guh_n_ref = guh_cache[num_tokens - 1];
+     if (!guh_n_ref.defined())
+         guh_n_ref = at::empty({2, num_tokens, guh.size(2)}, guh.options());
+@@ -32,8 +38,23 @@ void BC_GatedMLP::run_bszN_gr
+         gu_n_ref = at::empty({2, num_tokens, gu.size(2)}, gu.options());
+     at::Tensor guh_n     = guh_n_ref;
+     at::Tensor gu_n      = gu_n_ref;
+-    at::Tensor a_n       = a.slice(1, 0, num_tokens);
+-    at::Tensor down_xh_n = down_xh.slice(1, 0, num_tokens);
++    at::Tensor a_n;
++    at::Tensor down_xh_n;
++    if (num_tokens <= a.size(1))
++    {
++        a_n       = a.slice(1, 0, num_tokens);
++        down_xh_n = down_xh.slice(1, 0, num_tokens);
++    }
++    else
++    {
++        if (!a_wide.defined() || a_wide.size(1) < num_tokens)
++        {
++            a_wide       = at::empty({1, num_tokens, a.size(2)}, a.options());
++            down_xh_wide = at::empty({1, num_tokens, down_xh.size(2)}, down_xh.options());
++        }
++        a_n       = a_wide.slice(1, 0, num_tokens);
++        down_xh_n = down_xh_wide.slice(1, 0, num_tokens);
++    }
+ 
+     if (gu_ptrs_trellis)
+     {
+@@ -146,6 +167,20 @@ void BC_GatedMLP::run_bszN
+     }
+ }
+ 
++void BC_GatedMLP::run_wide
++(
++    const at::Tensor& x,
++    at::Tensor& d
++)
++{
++    // Any row count as one ungraphed pass: one gate/up launch, the activation and one down launch over all rows,
++    // instead of one MAX_BSZN-row graph replay per piece
++    int num_tokens = (int) x.numel() / (int) x.size(-1);
++    TORCH_CHECK(num_tokens >= 1, "run_wide: no rows");
++    c10::cuda::CUDAGuard device_guard(x.device());
++    run_bszN_gr(x, d, num_tokens, nullptr);
++}
++
+ void BC_MLP::run_bsz1_gr
+ (
+     const at::Tensor& x,
+diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.h b/exllamav3/exllamav3_ext/libtorch/mlp.h
+index c0a31e19..23eab000 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mlp.h
++++ b/exllamav3/exllamav3_ext/libtorch/mlp.h
+@@ -50,6 +50,10 @@ struct BC_GatedMLP
+     std::vector<at::Tensor> guh_cache;
+     std::vector<at::Tensor> gu_cache;
+ 
++    // Activation / down-input scratch for run_wide widths past MAX_BSZN, allocated on first use
++    at::Tensor a_wide;
++    at::Tensor down_xh_wide;
++
+     BC_GatedMLP
+     (
+         at::Tensor _guh,
+@@ -106,6 +110,13 @@ struct BC_GatedMLP
+         const at::Tensor& x,
+         at::Tensor& d
+     );
++
++    // Any row count, one ungraphed pass (EXL3_MOE_SHARED_WIDE: the shared expert of wide verify windows)
++    void run_wide
++    (
++        const at::Tensor& x,
++        at::Tensor& d
++    );
+ };
+ 
+ 
+diff --git a/exllamav3/exllamav3_ext/libtorch/mlp_bc.h b/exllamav3/exllamav3_ext/libtorch/mlp_bc.h
+index 8e9f1cdd..87906d1f 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mlp_bc.h
++++ b/exllamav3/exllamav3_ext/libtorch/mlp_bc.h
+@@ -37,7 +37,8 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
+     py::arg("down"),
+     py::arg("act_limit")
+ )
+-.def("run_bszN", &BC_GatedMLP::run_bszN);
++.def("run_bszN", &BC_GatedMLP::run_bszN)
++.def("run_wide", &BC_GatedMLP::run_wide);
+ 
+ py::class_<BC_MLP, std::shared_ptr<BC_MLP>>(m, "BC_MLP").def
+ (
+-- 
+2.43.0
+
