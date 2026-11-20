@@ -1,7 +1,7 @@
-From a5155d9ddbb18430bcd8449b9cdde0a92d87da9a Mon Sep 17 00:00:00 2001
+From 3280cbf175dc9a157af6daca10ca4ed25be879b5 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 08:45:57 -0500
-Subject: [PATCH 18/18] Generator: batched speculative accept
+Subject: [PATCH 18/21] Generator: batched speculative accept
  (EXL3_SD_BATCH_ACCEPT, default off)
 
 Multi-user verify rounds accepted job by job: each job's window samplers launched and read back on their own, then

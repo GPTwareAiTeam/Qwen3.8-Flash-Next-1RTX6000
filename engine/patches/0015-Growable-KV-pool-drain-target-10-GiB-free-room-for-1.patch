@@ -1,7 +1,7 @@
-From 6862ea7d06de0a785105dadb211125db3f6c13b5 Mon Sep 17 00:00:00 2001
+From 28a1cb7c921f041dd9a725f251afd26797922613 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 22:20:36 -0500
-Subject: [PATCH 15/15] Growable KV pool: drain target 10 GiB free, room for
+Subject: [PATCH 15/21] Growable KV pool: drain target 10 GiB free, room for
  16k-row prefill chunks after a drain
 
 ---

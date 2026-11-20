@@ -1,8 +1,8 @@
-From 7cff1c8088e78288da976273a0aad4f87896012a Mon Sep 17 00:00:00 2001
+From 8901015c1cedafb821b3dfa41faaad3ad40e9d1b Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 15:23:40 -0500
-Subject: [PATCH 5/7] DFlash2: capture the drafter layer stack as a CUDA graph
- (EXL3_DFLASH_GRAPH)
+Subject: [PATCH 05/21] DFlash2: capture the drafter layer stack as a CUDA
+ graph (EXL3_DFLASH_GRAPH)
 
 Sliding-window metadata and the input embedding are staged on device outside the capture; ring shifts fall back to eager. Lossless; c8 +4 %, code +5 %.
 ---

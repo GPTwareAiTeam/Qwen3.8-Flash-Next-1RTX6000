@@ -1,7 +1,7 @@
-From 79e13264124f9b5df189a37ef829eeb9eec861e3 Mon Sep 17 00:00:00 2001
+From 0c5bc7b3d012d61ef12898ecf26fd240f7bcb220 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 15:23:39 -0500
-Subject: [PATCH 2/7] DGEMV: dense decode GEMV with K6/K7 instances
+Subject: [PATCH 02/21] DGEMV: dense decode GEMV with K6/K7 instances
  (EXL3_DGEMV, default off)
 
 Split-K ordinary-launch GEMV for 1..48 rows, ported from the QMesh R5 fork with K 6/7 instances. Off by default: not bit-identical to the vendor path and net neutral on Qwen3.8-Flash-Next.
@@ -115,7 +115,7 @@ index 00000000..b6c864ef
 +    }
 diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
 new file mode 100644
-index 00000000..5c1df391
+index 00000000..6c5c6958
 --- /dev/null
 +++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
 @@ -0,0 +1,220 @@
@@ -197,7 +197,7 @@ index 00000000..5c1df391
 +    return select_kernel(K, MT, c_fp32, false) && select_kernel(K, MT, c_fp32, true);
 +}
 +
-+// One workspace per (device, stream): two streams may run dense GEMMs concurrently (the NODE-A compute stream
++// One workspace per (device, stream): two streams may run dense GEMMs concurrently (the main compute stream
 +// and the head stream), and the self-resetting counters and partials must not be shared between them.
 +// The pointer is baked into captured graphs, so a buffer lives for the process. First use may be inside
 +// a capture (graphs capture on their own stream): the allocation then runs in relaxed capture mode and

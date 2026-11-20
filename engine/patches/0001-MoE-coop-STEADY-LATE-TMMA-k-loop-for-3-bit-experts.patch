@@ -1,7 +1,7 @@
-From 3929ccfe3d4a3653997170ec0ac0be99a75f09de Mon Sep 17 00:00:00 2001
+From 87786cf3ea0c04bf81e9e3d1d5b3ffc2165246e9 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 15:23:39 -0500
-Subject: [PATCH 1/7] MoE coop: STEADY/LATE/TMMA k-loop for 3-bit experts
+Subject: [PATCH 01/21] MoE coop: STEADY/LATE/TMMA k-loop for 3-bit experts
 
 Port of the cooperative MoE decode k-loop from the QMesh R5 exllamav3 fork: full-ring iterations without bounds checks, late decode from the ring, one m16n8k16 per tile. Bit-identical outputs; c1 +4.7 %, c2/c4 +9 % on Qwen3.8-Flash-Next.
 ---

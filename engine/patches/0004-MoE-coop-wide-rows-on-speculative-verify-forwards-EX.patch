@@ -1,7 +1,7 @@
-From 54be8d0bafa2bcb73729a4fed53806fa162df104 Mon Sep 17 00:00:00 2001
+From 34fcc3562005177ea89b6b2be7c2e9c7c1900b8b Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 15:23:40 -0500
-Subject: [PATCH 4/7] MoE coop: wide rows on speculative-verify forwards
+Subject: [PATCH 04/21] MoE coop: wide rows on speculative-verify forwards
  (EXL3_MOE_COOP_ROWS)
 
 EXL3_MOE_COOP_ROWS (8..64, default 8) routes verify windows up to that width through the coop kernels. Prompt prefill keeps the fused tier, so single-request output is independent of the setting. c8 +20 % at 64.

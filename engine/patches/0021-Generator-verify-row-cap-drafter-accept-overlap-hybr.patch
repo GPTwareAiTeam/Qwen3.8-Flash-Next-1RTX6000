@@ -1,0 +1,366 @@
+From 329515ccb607048b29c7fa2d647948efc3a275dc Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:31:16 -0500
+Subject: [PATCH 21/21] Generator: verify-row cap, drafter/accept overlap,
+ hybrid drafting for a single job
+
+EXL3_DRAFT_MAX_ROWS=N caps a round's verify rows (jobs x (drafts + 1)) at N by trimming the draft width, so rounds
+with 9-12 jobs stay inside the 64-row coop / graphed verify paths (no-op whenever jobs x (drafts + 1) <= N).
+EXL3_SD_DRAFT_OVERLAP=1 (with EXL3_SD_BATCH_ACCEPT=1 and a DFlash drafter with sliding-window states): once the
+round's samples are on the host, the predicted accepted lengths drive the drafter's K/V update and the next draft
+block's launch before the host accept loop; the next round checks job set, positions and anchors and rolls the
+block back on any mismatch (EOS, requeue, rewind, job start, prefill, checkpoint boundary, window shift).
+EXL3_HYBRID_SOLO=1 runs hybrid (suffix-match) drafting only in rounds with exactly one active job.
+The sampler past-ids fix of EXL3_SD_BATCH_ACCEPT also applies under EXL3_SD_BATCH_READBACK. All default off.
+---
+ exllamav3/generator/generator.py      | 214 +++++++++++++++++++++-----
+ exllamav3/generator/sampler/custom.py |   6 +-
+ 2 files changed, 182 insertions(+), 38 deletions(-)
+
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index 57c5b844..3cb7e000 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -6,6 +6,7 @@ from ..cache.cache import Cache
+ from ..cache.recurrent import RecurrentCache, PairedState, host_pool, mp_host_pool_release
+ from ..tokenizer.tokenizer import Tokenizer
+ from ..constants import PAGE_SIZE
++from ..modules.sliding_attn import SlidingAttention
+ from ..util import cuda_sync_active
+ 
+ logger = logging.getLogger(__name__)
+@@ -45,6 +46,17 @@ _SD_WINDOW_BATCH = os.environ.get("EXL3_SD_WINDOW_BATCH", "0") == "1"
+ # acceptance order and the settled states are those of the serial loop. Implies the batched readback for the jobs
+ # it covers; default off, for A/B
+ _SD_BATCH_ACCEPT = os.environ.get("EXL3_SD_BATCH_ACCEPT", "0") == "1"
++# Total verify rows per round (bsz x (drafts + 1)) cap, EXL3_DRAFT_MAX_ROWS (default 0 = off); 64 = EXL3_MOE_COOP_ROWS
++_DRAFT_MAX_ROWS = int(os.environ.get("EXL3_DRAFT_MAX_ROWS", "0"))
++# Drafter / accept overlap (EXL3_SD_DRAFT_OVERLAP=1, needs EXL3_SD_BATCH_ACCEPT=1 and a DFlash drafter with sliding-window
++# states): once the round's staged samples are on the host, every job's accepted length and next anchor are known
++# (leading matches of the staged tokens against the draft), so the drafter's K/V update and its next block launch
++# before the host-side accept loop and run under it. The loop's actual lengths are checked afterwards; any difference
++# (EOS / requeue / checkpoint stop) or a changed job set next round rolls the speculative drafter pass back and the
++# round proceeds as without the switch. Same drafter inputs, same drafts, same calibrator decisions; default off
++_SD_DRAFT_OVERLAP = os.environ.get("EXL3_SD_DRAFT_OVERLAP", "0") == "1"
++# Hybrid (suffix-match) drafting only while exactly one job is active (EXL3_HYBRID_SOLO=1; default off = every round)
++_HYBRID_SOLO = os.environ.get("EXL3_HYBRID_SOLO", "0") == "1"
+ 
+ 
+ def _window_batchable(job, W):
+@@ -338,6 +350,7 @@ class Generator:
+         # Filter threads
+         self.filter_pool = ThreadPoolExecutor(max_workers = 16)
+         self.filter_queue = []
++        self._spec_draft = None   # EXL3_SD_DRAFT_OVERLAP: next round's drafter block launched under the accept loop
+ 
+         # Rounds that verified a hybrid (long suffix-match) draft
+         self.hybrid_rounds = 0
+@@ -755,6 +768,16 @@ class Generator:
+         results = []
+         self.iterate_start_jobs(results)
+ 
++        # A speculative drafter block (EXL3_SD_DRAFT_OVERLAP) stands only for an unchanged decoding set: undo it before
++        # any job prefills (a job just started, or one still ingesting), and before a recurrent checkpoint could stash a
++        # drafter state that holds the provisional block
++        if self._spec_draft is not None and (
++                any(not job.is_prefill_done() for job in self.active_jobs)
++                or (self.recurrent_cache is not None
++                    and any(job.is_checkpoint_boundary() for job in self._spec_draft["jobs"] if job in self.active_jobs))):
++            self._spec_draft_rollback(self._spec_draft)
++            self._spec_draft = None
++
+         # Perform one round of prefill. While some active job is already generating, prompt ingestion shares
+         # the GPU with it: at most one job with prompt left to ingest runs a pass per iteration, with the
+         # shared chunk size, and only once the cooldown since the previous pass has elapsed, so every call
+@@ -808,10 +831,24 @@ class Generator:
+         else:
+             draft_tokens = None
+ 
+-        # Long suffix-match draft over the regular one, when a job is repeating its context
+-        if self.hybrid_draft_tokens:
++        # Long suffix-match draft over the regular one, when a job is repeating its context (EXL3_HYBRID_SOLO=1: only
++        # while exactly one job is active, where the wider verify window costs no other job anything)
++        if self.hybrid_draft_tokens and (not _HYBRID_SOLO or len(self.active_jobs) == 1):
+             draft_tokens = self.iterate_hybrid_gen(draft_tokens)
+ 
++        # Total verify-row cap (EXL3_DRAFT_MAX_ROWS, default 0 = off): a window of bsz rows x (w + 1) positions above
++        # the cap is cut to w = cap // bsz - 1 drafts per row, so a full 9-12 job round stays inside the 64-row
++        # fused/graphed verify paths. bsz is the number of decoding rows, not the draft buffer's height (the drafters
++        # return a view of all max_batch_size rows of their pinned buffer). No-op whenever bsz * (w + 1) <= cap
++        if _DRAFT_MAX_ROWS and draft_tokens is not None:
++            bsz = sum(len(job.sequences) for job in self.active_jobs if job.is_prefill_done())
++            w = draft_tokens.shape[-1]
++            if bsz * (w + 1) > _DRAFT_MAX_ROWS:
++                w_cap = _DRAFT_MAX_ROWS // bsz - 1
++                draft_tokens = draft_tokens[:, :w_cap] if w_cap > 0 else None
++                if draft_tokens is None:
++                    self._draft_conf_round = None
++
+         self.iterate_gen(results, draft_tokens)
+ 
+         # Visualization
+@@ -1253,22 +1290,39 @@ class Generator:
+ 
+         self._draft_conf_round = None
+ 
+-        # Get shape of active batch
+-        batch_size = 0
+-        max_seq_len = 0
++        # A drafter pass launched under the previous accept loop (EXL3_SD_DRAFT_OVERLAP) is this round's draft when the
++        # job set and every job's position came out as predicted; otherwise it is undone and the round drafts afresh
++        spec = self._spec_draft
++        self._spec_draft = None
++        if spec is not None:
++            jobs = [job for job in self.active_jobs if job.is_prefill_done()]
++            if self._spec_draft_valid(spec, jobs):
++                return self._dflash_draft_finish(spec["pending"])
++            self._spec_draft_rollback(spec)
++
++        jobs = []
+         for job in self.active_jobs:
+             if not job.is_prefill_done(): continue
+-            max_seq_len = max(
+-                max_seq_len,
+-                job.get_max_seq_len() + self.num_draft_tokens + 1,
+-                job.get_max_seq_len() + self.draft_model.config.block_size + 1
+-            )
+-            batch_size += 1
+-        if batch_size == 0:
++            if job.time_first_token is None:
++                cuda_sync_active()
++                job.time_first_token = time.time()
++            jobs.append(job)
++        if not jobs:
+             return None
++        anchors = torch.cat([ids for job in jobs for ids in job.get_input_ids_list()], dim = 0)
++        pending = self._dflash_draft_launch(jobs, [job.sequences[0].kv_position for job in jobs], anchors)
++        return self._dflash_draft_finish(pending)
+ 
+-        # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
+-        window = self.num_draft_tokens
++
++    def _dflash_draft_launch(self, jobs: list, kv_positions: list[int], anchors: torch.Tensor) -> dict:
++        """
++        Queue the DFlash drafter's block for the given decoding jobs (one sequence each) at the given K/V positions,
++        anchored on the given (bsz, 1) last tokens: block table staging, drafter forward and selector walk. Nothing is
++        read back; _dflash_draft_finish turns the result into the round's draft
++        """
++        batch_size = len(jobs)
++        bsz_max = max(kv_positions) + 1
++        max_seq_len = max(bsz_max + self.num_draft_tokens + 1, bsz_max + self.draft_model.config.block_size + 1)
+ 
+         # Create block index table for batch
+         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+@@ -1278,26 +1332,14 @@ class Generator:
+         block_index = self._staging("draft_block_index", batch_size, max_pages_batch)
+         block_index.zero_()
+         cache_seqlens = self._staging("draft_cache_seqlens", batch_size)
+-        batch = 0
+-        for job in self.active_jobs:
+-            if not job.is_prefill_done(): continue
+-            for seq in job.sequences:
+-                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+-                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+-                cache_seqlens[batch] = seq.kv_position
+-                batch += 1
++        for batch, (job, kv) in enumerate(zip(jobs, kv_positions)):
++            seq_block_index = job.sequences[0].block_index_tensor[:, :max_pages_batch]
++            block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
++            cache_seqlens[batch] = kv
+ 
+-        # Collect input IDs
+-        input_ids_list = []
+-        for job in self.active_jobs:
+-            if not job.is_prefill_done(): continue
+-            if job.time_first_token is None:
+-                cuda_sync_active()
+-                job.time_first_token = time.time()
+-            job_ids = job.get_input_ids_list()
+-            input_ids_list += job_ids
++        # Input IDs
+         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
+-        batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
++        batch_ids.copy_(anchors)
+ 
+         # Run draft model. A drafter with sliding-window states appends its block to each row's
+         # window ring; the rows the verification accepts are written over it afterwards
+@@ -1309,7 +1351,7 @@ class Generator:
+             "cache_seqlens": cache_seqlens,
+         }
+         if self.draft_recurrent:
+-            params["recurrent_states"] = [job.recurrent_state.draft for job in self.active_jobs if job.is_prefill_done()]
++            params["recurrent_states"] = [job.recurrent_state.draft for job in jobs]
+         if self.draft_calibrator is not None:
+             params["export_draft_conf"] = True
+         out_state = self.draft_model.forward(
+@@ -1317,6 +1359,20 @@ class Generator:
+             params = params,
+         )
+         new_ids = self.draft_model.sample_from_state(out_state, params)
++        return {"new_ids": new_ids, "params": params, "batch_size": batch_size}
++
++
++    def _dflash_draft_finish(self, pending: dict):
++        """
++        The round's draft from a launched drafter block: confidence-head cap, calibrated truncation (host readback of
++        the drafter's scores, the calibrator's threshold at this point of the round) and the pinned copy of the ids
++        """
++        new_ids = pending["new_ids"]
++        params = pending["params"]
++        batch_size = pending["batch_size"]
++
++        # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
++        window = self.num_draft_tokens
+ 
+         # Draft models with a confidence head cap the usable draft length per round;
+         # 0 means no draft position cleared the threshold, so skip drafting entirely
+@@ -1367,6 +1423,79 @@ class Generator:
+         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+         return self.draft_ids_pinned[:, :window]
+ 
++    def _spec_draft_launch(self, batch_jobs, draft_tokens, prestaged, W, p_export_states, block_index, p_cache_seqlens):
++        """
++        EXL3_SD_DRAFT_OVERLAP: with every row's staged window on the host, predict each job's accepted length (leading
++        draft matches, plus one) and next anchor (its last accepted sample), write the drafter K/V for those lengths and
++        queue the next round's drafter block, all before the host accept loop. Returns the predicted lengths (the
++        caller skips its own drafter update when the loop agrees) or None when the round doesn't qualify
++        """
++        if not (self.dflash_draft and self.draft_recurrent) or draft_tokens is None or W < 2:
++            return None
++        if not all(isinstance(a, SlidingAttention) for a in self.draft_model.attn_modules):
++            return None
++        if len(prestaged) != len(batch_jobs) or any(len(job.sequences) != 1 for job in batch_jobs):
++            return None
++        # A job about to start or still ingesting undoes the block next round anyway
++        if self.pending_jobs or len(batch_jobs) != len(self.active_jobs):
++            return None
++        # The speculative block must not shift a window ring (that moves stored rows, which a rollback can't undo):
++        # rows whose block would pass the ring end leave the round to the regular path
++        S = self.draft_model.attn_modules[0].kv_state_size
++        block = self.draft_model.config.block_size
++        lengths, anchors = [], []
++        for j, job in enumerate(batch_jobs):
++            staged = prestaged[j][0]
++            a = 1
++            while a < W and staged[a - 1][0].item() == draft_tokens[j, a - 1].item():
++                a += 1
++            lengths.append(a)
++            anchors.append(staged[a - 1][0].clone())
++            ds = job.recurrent_state.draft
++            if job.sequences[0].kv_position + a + block - ds.window_beg > S:
++                return None
++        states = [job.recurrent_state.draft for job in batch_jobs]
++        for ds in states:
++            ds.rewind(0)
++        self.draft_model.update_kv_from_target(
++            target_hidden = p_export_states,
++            cache = self.draft_cache,
++            lengths = lengths,
++            params = {"block_table": block_index, "cache_seqlens": p_cache_seqlens, "recurrent_states": states},
++        )
++        kv_next = [job.sequences[0].kv_position + n for job, n in zip(batch_jobs, lengths)]
++        saved = [ds.position for ds in states]
++        pending = self._dflash_draft_launch(batch_jobs, kv_next, torch.cat(anchors, dim = 0))
++        self._spec_draft = {
++            "jobs": list(batch_jobs), "states": states, "saved": saved, "kv": kv_next,
++            "anchors": [int(t.item()) for t in anchors], "pending": pending, "lengths": lengths,
++        }
++        return lengths
++
++
++    def _spec_draft_valid(self, spec, jobs) -> bool:
++        if len(jobs) != len(spec["jobs"]) or any(a is not b for a, b in zip(jobs, spec["jobs"])):
++            return False
++        for job, ds, kv, anchor in zip(jobs, spec["states"], spec["kv"], spec["anchors"]):
++            seq = job.sequences[0]
++            if job.recurrent_state is None or job.recurrent_state.draft is not ds or seq.kv_position != kv:
++                return False
++            if len(seq.sequence_ids) != kv + 1 or seq.sequence_ids.torch_slice(kv, kv + 1).item() != anchor:
++                return False
++        return True
++
++
++    def _spec_draft_rollback(self, spec):
++        """Undo the speculative drafter block: the drafter's window rings return to the positions they had after the
++        K/V update (the appended block rows are past them and are overwritten later); the launch's staging buffers are
++        released by draining the stream first"""
++        torch.cuda.synchronize(self.draft_model.input_layer.device)
++        for job, ds, pos in zip(spec["jobs"], spec["states"], spec["saved"]):
++            if job.recurrent_state is not None and job.recurrent_state.draft is ds and job in self.active_jobs:
++                ds.position = pos
++                ds.last_history = 0
++
++
+ 
+     def iterate_ngram_gen(self, results: list):
+ 
+@@ -1630,6 +1759,7 @@ class Generator:
+         # Target-side recurrent rewinds deferred to the end of the accept loop (EXL3_SD_BATCH_ACCEPT; jobs whose
+         # windows were staged up front only: nothing in their accept path reads the state before it is settled)
+         pending_rewinds = None
++        spec_lengths = None     # EXL3_SD_DRAFT_OVERLAP: per-job accepted lengths the drafter update ran with
+ 
+         # Reject the trailing draft positions after the last accepted token at index i: count them, roll back the
+         # job's recurrent state and return cache pages to the accepted position
+@@ -1750,6 +1880,9 @@ class Generator:
+                     jj += 1
+                 if prestaged:
+                     torch.cuda.synchronize(batch_logits.device)
++                    if _SD_DRAFT_OVERLAP:
++                        spec_lengths = self._spec_draft_launch(batch_jobs, draft_tokens, prestaged, W, p_export_states,
++                                                               block_index, p_cache_seqlens)
+ 
+             for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
+                 if a == b: continue
+@@ -1917,10 +2050,21 @@ class Generator:
+                     cal.add_label(conf[a].item(), ids_full[a].item() == tail)
+             cal.decay_step()
+ 
++        # EXL3_SD_DRAFT_OVERLAP: the drafter update already ran under the accept loop with the predicted lengths. When
++        # the loop accepted exactly those (no EOS, requeue or rewind cut a window short) it stands and the next block
++        # is in flight; otherwise the speculative pass is undone and the drafter settles below as usual
++        spec_done = False
++        if spec_lengths is not None:
++            if (spec_lengths == accepted_lengths and not rewound_jobs and not completed_jobs and not requeuing_jobs):
++                spec_done = True
++            else:
++                self._spec_draft_rollback(self._spec_draft)
++                self._spec_draft = None
++
+         # Settle a recurrent drafter's speculative pass: it consumed the round's input token and every
+         # drafted token (last_history of them); the rejected drafts are undone, leaving its state at
+         # the accepted prefix, i.e. at the new K/V position (or behind it after a long hybrid round)
+-        if self.draft_recurrent and draft_tokens is not None:
++        if self.draft_recurrent and draft_tokens is not None and not spec_done:
+             accepted_idx = 0
+             for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                 if a_idx == b_idx:
+@@ -1934,7 +2078,7 @@ class Generator:
+ 
+         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
+         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
+-        if self.dflash_draft:
++        if self.dflash_draft and not spec_done:
+             update_params = {
+                 "block_table": block_index,
+                 "cache_seqlens": p_cache_seqlens,
+diff --git a/exllamav3/generator/sampler/custom.py b/exllamav3/generator/sampler/custom.py
+index eb6f19f5..ba546799 100644
+--- a/exllamav3/generator/sampler/custom.py
++++ b/exllamav3/generator/sampler/custom.py
+@@ -17,9 +17,9 @@ import torch.nn.functional as F
+ # Collapse eligible sampler stacks into the fused kernel path; EXL3_FUSED_SAMPLER=0 keeps the
+ # original step-by-step implementation (for testing/validation)
+ fused_sampler_enable = os.environ.get("EXL3_FUSED_SAMPLER", "1") != "0"
+-# EXL3_SD_BATCH_ACCEPT=1: a sampler reads past ids only if a step that survives simplification needs them (see
+-# CustomSampler.__init__)
+-_sd_batch_accept = os.environ.get("EXL3_SD_BATCH_ACCEPT", "0") != "0"
++# EXL3_SD_BATCH_ACCEPT=1 or EXL3_SD_BATCH_READBACK=1: a sampler reads past ids only if a step that survives
++# simplification needs them (see CustomSampler.__init__)
++_sd_batch_accept = os.environ.get("EXL3_SD_BATCH_ACCEPT", "0") != "0" or os.environ.get("EXL3_SD_BATCH_READBACK", "0") != "0"
+ 
+ class SS(Enum):
+     INIT = 0  # only state.in_logits is valid
+-- 
+2.43.0
+

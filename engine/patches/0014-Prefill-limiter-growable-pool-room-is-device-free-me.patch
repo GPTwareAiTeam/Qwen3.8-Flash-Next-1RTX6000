@@ -1,7 +1,7 @@
-From aab77c4ab9921993d9f12e6eb003f76d61882c66 Mon Sep 17 00:00:00 2001
+From a733c258fd0cbb46a991810139570fa20283e678 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 21:41:48 -0500
-Subject: [PATCH 14/15] Prefill limiter (growable pool): room is device-free
+Subject: [PATCH 14/21] Prefill limiter (growable pool): room is device-free
  memory only; torch's cached blocks are released only when that is short
 
 ---

@@ -1,0 +1,82 @@
+From 731ec8d6e04ad497d9fd45833e3da5dfefd5e7bb Mon Sep 17 00:00:00 2001
+From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:31:16 -0500
+Subject: [PATCH 19/21] BC graph slots for up to 12 jobs (attention, Gated
+ DeltaNet, MLA)
+
+The batched-cache attention, GDN and MLA decode paths capture per-slot graphs for at most MAX_BSZ jobs; above
+that they fall back to eager kernels. MAX_BSZ 8 -> 12 (bc_attn.py and the three libtorch headers) so rounds
+with 9-12 active jobs stay on the captured paths (max_batch_size 12).
+---
+ exllamav3/exllamav3_ext/libtorch/attention.h       | 2 +-
+ exllamav3/exllamav3_ext/libtorch/gated_delta_net.h | 4 ++--
+ exllamav3/exllamav3_ext/libtorch/mla_attention.h   | 2 +-
+ exllamav3/modules/attention_fn/bc_attn.py          | 4 +++-
+ 4 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/libtorch/attention.h b/exllamav3/exllamav3_ext/libtorch/attention.h
+index 8a5b8691..3f838640 100644
+--- a/exllamav3/exllamav3_ext/libtorch/attention.h
++++ b/exllamav3/exllamav3_ext/libtorch/attention.h
+@@ -34,7 +34,7 @@
+ 
+ struct BC_Attention
+ {
+-    static constexpr int MAX_BSZ = 8;
++    static constexpr int MAX_BSZ = 12;  // must match MAX_BSZ in modules/attention_fn/bc_attn.py
+     static constexpr int MAX_QLEN = 16;
+ 
+     // Model config. hidden_size_padded > hidden_size when the model dim is not a multiple of
+diff --git a/exllamav3/exllamav3_ext/libtorch/gated_delta_net.h b/exllamav3/exllamav3_ext/libtorch/gated_delta_net.h
+index ea2b7918..7e091913 100644
+--- a/exllamav3/exllamav3_ext/libtorch/gated_delta_net.h
++++ b/exllamav3/exllamav3_ext/libtorch/gated_delta_net.h
+@@ -107,7 +107,7 @@ struct BC_GatedDeltaNet
+ // shape gets its own lazily-configured Slot with exact-size scratch statics
+ struct BC_GatedDeltaNetSplit
+ {
+-    static constexpr int MAX_BSZ = 8;
++    static constexpr int MAX_BSZ = 12;  // must match MAX_BSZ in modules/attention_fn/bc_attn.py
+     static constexpr int MAX_QLEN = 16;
+ 
+     std::shared_ptr<BC_LinearEXL3> qkv_proj;
+@@ -369,7 +369,7 @@ struct BC_GatedDeltaNetSplit
+ // x copies into xp at the graph head, the padded o_proj output trims into y at the tail
+ struct BC_Mamba2
+ {
+-    static constexpr int MAX_BSZ = 8;
++    static constexpr int MAX_BSZ = 12;  // must match MAX_BSZ in modules/attention_fn/bc_attn.py
+     static constexpr int MAX_QLEN = 16;
+ 
+     std::shared_ptr<BC_LinearEXL3> in_proj;
+diff --git a/exllamav3/exllamav3_ext/libtorch/mla_attention.h b/exllamav3/exllamav3_ext/libtorch/mla_attention.h
+index 299a9615..268d6731 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mla_attention.h
++++ b/exllamav3/exllamav3_ext/libtorch/mla_attention.h
+@@ -43,7 +43,7 @@
+ 
+ struct BC_MLAttention
+ {
+-    static constexpr int MAX_BSZ = 8;
++    static constexpr int MAX_BSZ = 12;  // must match MAX_BSZ in modules/attention_fn/bc_attn.py
+     static constexpr int MAX_QLEN = 16;
+ 
+     // Model config
+diff --git a/exllamav3/modules/attention_fn/bc_attn.py b/exllamav3/modules/attention_fn/bc_attn.py
+index f38c077d..17cf909f 100644
+--- a/exllamav3/modules/attention_fn/bc_attn.py
++++ b/exllamav3/modules/attention_fn/bc_attn.py
+@@ -51,7 +51,9 @@ def _trace_build(m, result, kind):
+         print(f" -- BC-{kind}: {'built' if result is not None else 'DECLINED'}"
+               f" layer {getattr(m, 'layer_idx', '?')} device {m.device}")
+ 
+-MAX_BSZ = 8
++# Graph-slot job bound (BC attention / GDN / Mamba2 decode slots): 9 = the server's max_batch_size 9 (must match
++# MAX_BSZ in exllamav3_ext/libtorch/attention.h, gated_delta_net.h and mla_attention.h)
++MAX_BSZ = 12
+ MAX_QLEN = 16
+ MAX_R = MAX_BSZ * MAX_QLEN
+ 
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
-From 5442556151a453aa90623ab9beb6fa66be523084 Mon Sep 17 00:00:00 2001
+From 8092400ecabca8e99b4cae374b8f3014ea88f0df Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 21:41:27 -0500
-Subject: [PATCH 13/15] Growable KV pool: release mapped pages from the top
+Subject: [PATCH 13/21] Growable KV pool: release mapped pages from the top
  when the queue drains (EXL3_KV_GROW_DRAIN_FREE_MIB, default 6144), never
  below the highest referenced page or the premapped region
  (EXL3_KV_GROW_PREMAP_TOKENS, default 262144); limiter releases torch's cached
@@ -90,10 +90,10 @@ index 7a423a10..a9ad0d30 100644
          g = self.granule
          return (nbytes + g - 1) // g * g
 diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
-index 8e825996..a25f0413 100644
+index 941c300a..198d7f1d 100644
 --- a/exllamav3/generator/generator.py
 +++ b/exllamav3/generator/generator.py
-@@ -217,6 +217,7 @@ class Generator:
+@@ -251,6 +251,7 @@ class Generator:
  
          # Paging
          self.pagetable = PageTable(self, cache)
@@ -101,7 +101,7 @@ index 8e825996..a25f0413 100644
          # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
          cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
          self.cache_owner_serial = cache.owner_serial
-@@ -953,6 +954,8 @@ class Generator:
+@@ -987,6 +988,8 @@ class Generator:
              # Before pruning: a checkpoint stranded in VRAM/RAM terms may be anchored by pages on disk. One
              # step only; the async generator does the rest while idle (idle_work)
              self.flush_cache_to_disk(max_pages = self._idle_flush_budget())

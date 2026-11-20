@@ -1,7 +1,7 @@
-From ad2e02eb36181624b2e572b5e9f8c6068f955f2f Mon Sep 17 00:00:00 2001
+From 1e276651495cc0e59f5e1bee909d212c43d6e90b Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 08:45:32 -0500
-Subject: [PATCH 16/18] GatedResidual: resident int8 tables for the tiled mix
+Subject: [PATCH 16/21] GatedResidual: resident int8 tables for the tiled mix
  (EXL3_HC_TABLE_CACHE, default off)
 
 The tiled path (more than FUSED_MAX_R rows: wide verify windows, prefill) derived its int8 hi/lo tables from the

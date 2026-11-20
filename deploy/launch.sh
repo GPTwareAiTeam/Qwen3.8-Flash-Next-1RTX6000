@@ -2,7 +2,7 @@
 # Launch TabbyAPI with the patched exllamav3 for Qwen3.8-Flash-Next on one GPU.
 #
 # Required:
-#   TABBY=<dir>       TabbyAPI checkout (564f8fb + deploy/tabbyapi-prefill-chunk-size.patch)
+#   TABBY=<dir>       TabbyAPI checkout (564f8fb + deploy/tabbyapi-v3.patch)
 #   ENGINE=<dir>      exllamav3 checkout (v1.6.4 + engine/patches), absolute path; put first on PYTHONPATH
 # Optional:
 #   PYTHON=<bin>      interpreter with torch + TabbyAPI requirements (default: python3)
@@ -67,8 +67,22 @@ export EXL3_MOE_MTILE=0           # one fused launch instead of 32/64-row tiles 
 export EXL3_MOE_SHARED_COOP=0     # shared expert as its own graph (runs on the side stream below)
 export EXL3_MOE_COOP_WIDE=1       # wide coop tile for the routed experts
 export EXL3_MOE_COOP_ROWS=64      # verify windows up to 64 rows through the coop kernels
+export EXL3_MOE_COOP_FAST_RUNS=1  # counting-sort run table for wide verify windows (bit-identical)
 export EXL3_MOE_SHARED_SIDE=1     # shared expert overlaps the routed experts on a side stream
+export EXL3_MOE_SHARED_WIDE=1     # shared expert of a wide verify window as one pass (rounding-level)
+export EXL3_HC_TABLE_CACHE=1      # hyper-connection int8 tables built once at load (bit-identical, +1.3 GiB VRAM)
 export EXL3_DFLASH_GRAPH=1        # DFlash2 drafter layer stack as a CUDA graph
+
+# Speculative decoding
+export EXL3_SD_BATCH_ACCEPT=1     # one readback per round for all users; recurrent rewinds settled in one batch
+export EXL3_SD_DRAFT_OVERLAP=1    # drafter's next block launched under the host accept loop (rolled back on mismatch)
+export EXL3_DRAFT_MAX_ROWS=64     # verify rows per round capped at 64 (9-12 users get fewer drafts each)
+export EXL3_HYBRID_SOLO=1         # hybrid_draft_tokens only while exactly one request is active
+
+# KV pool and prefill: the pool is reserved as virtual memory and mapped as it fills, so an empty pool leaves its
+# VRAM to prefill; the adaptive limiter sizes each prefill chunk (up to prefill_chunk_size) to the free memory
+export EXL3_KV_GROW=${EXL3_KV_GROW:-1}
+export EXL3_PREFILL_ADAPTIVE=${EXL3_PREFILL_ADAPTIVE:-1}
 
 cd "$TABBY"
 echo "launch: gpu=$GPU port=$PORT engine=$ENGINE config=$CONFIG warmup=$WARMUP ngram_lock=$EXL3_NGRAM_LOCK"

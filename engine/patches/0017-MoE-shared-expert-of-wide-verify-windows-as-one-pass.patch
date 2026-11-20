@@ -1,7 +1,7 @@
-From 8d8a0f239d48b73ce1ec4c633ef54946f6adef2d Mon Sep 17 00:00:00 2001
+From 8dc3f782bb8728988e07b744d259901d6855ac24 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 08:45:42 -0500
-Subject: [PATCH 17/18] MoE: shared expert of wide verify windows as one pass
+Subject: [PATCH 17/21] MoE: shared expert of wide verify windows as one pass
  (EXL3_MOE_SHARED_WIDE, default off)
 
 Verify windows wider than MAX_BSZN rows (multi-user rounds) ran the shared expert's 8-row graph once per 8-row

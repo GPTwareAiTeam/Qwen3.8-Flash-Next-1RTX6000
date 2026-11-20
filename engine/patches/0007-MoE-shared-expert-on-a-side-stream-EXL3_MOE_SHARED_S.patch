@@ -1,7 +1,7 @@
-From 1ab7ca2b4a57ad42d3347079653ad00ac8b7f34a Mon Sep 17 00:00:00 2001
+From 7c0b944771bf37f31e9067f8698a7c9f56ce6474 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 15:23:40 -0500
-Subject: [PATCH 7/7] MoE: shared expert on a side stream
+Subject: [PATCH 07/21] MoE: shared expert on a side stream
  (EXL3_MOE_SHARED_SIDE); DGEMV per-device workspace
 
 The shared expert runs on a high-priority side stream and joins before the routed down projection. Bit-identical; c1 +6 %, c8 +12 %. DGEMV now uses one small workspace per device (EXL3_DGEMV_WS_MB, default 4) instead of 64 MiB per (device, stream). Drops a DGEMV test assertion that measured torch's CUDA-graph pool rather than DGEMV.
@@ -176,7 +176,7 @@ index 82e4a42d..0b0c43c4 100644
      (
          const at::Tensor& y,
 diff --git a/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
-index 5c1df391..85d5fa8e 100644
+index 6c5c6958..85d5fa8e 100644
 --- a/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
 +++ b/exllamav3/exllamav3_ext/quant/exl3_dgemv.cu
 @@ -32,12 +32,26 @@ matrix's (rows, k, n) (exl3_dgemv_ns::splits_for): ~EXL3_DGEMV_TARGET_BLOCKS blo
@@ -214,7 +214,7 @@ index 5c1df391..85d5fa8e 100644
      return select_kernel(K, MT, c_fp32, false) && select_kernel(K, MT, c_fp32, true);
  }
  
--// One workspace per (device, stream): two streams may run dense GEMMs concurrently (the NODE-A compute stream
+-// One workspace per (device, stream): two streams may run dense GEMMs concurrently (the main compute stream
 -// and the head stream), and the self-resetting counters and partials must not be shared between them.
 -// The pointer is baked into captured graphs, so a buffer lives for the process. First use may be inside
 -// a capture (graphs capture on their own stream): the allocation then runs in relaxed capture mode and

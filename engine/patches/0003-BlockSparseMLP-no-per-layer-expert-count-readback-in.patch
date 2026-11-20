@@ -1,8 +1,8 @@
-From d6acb88c100715de9d3905dcc1ecb2dbc4f01e32 Mon Sep 17 00:00:00 2001
+From 5d6df6ab710a01df60d17126068022dbcc31833f Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 15:23:40 -0500
-Subject: [PATCH 3/7] BlockSparseMLP: no per-layer expert-count readback in the
- fused tier
+Subject: [PATCH 03/21] BlockSparseMLP: no per-layer expert-count readback in
+ the fused tier
 
 When every expert fits the fused kernel (num_tokens <= fused_rows, single tile), skip the host readback of expert counts and count with scatter_add_ on device. Removes one GPU->CPU sync per MoE layer; bit-identical; c2 +20-23 %. EXL3_MOE_NO_READBACK=0 restores the readback.
 ---

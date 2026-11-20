@@ -1,11 +1,11 @@
-From c556c61dedee6b2205250260ef2a5dce3b4bb54c Mon Sep 17 00:00:00 2001
+From d73cd898ae90d0597bc66676f804237fa9fa8bd6 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 15:22:12 -0500
-Subject: [PATCH] Generator: speculative decoding host readbacks (opt-in):
- EXL3_SD_DEFER_DRAFT_CONF one pinned readback per draft round for the
- confidence cut; EXL3_SD_BATCH_READBACK all verify-window samplers launched up
- front with one synchronize when no per-position constraint applies;
- EXL3_SD_WINDOW_BATCH one fused greedy launch over the window
+Subject: [PATCH 08/21] Generator: speculative decoding host readbacks
+ (opt-in): EXL3_SD_DEFER_DRAFT_CONF one pinned readback per draft round for
+ the confidence cut; EXL3_SD_BATCH_READBACK all verify-window samplers
+ launched up front with one synchronize when no per-position constraint
+ applies; EXL3_SD_WINDOW_BATCH one fused greedy launch over the window
 
 ---
  exllamav3/generator/generator.py      | 101 ++++++++++++++++++++++++--

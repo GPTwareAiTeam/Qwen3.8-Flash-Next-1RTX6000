@@ -1,7 +1,7 @@
-From 25c86f383646e4d6cdc7116a1bc1d4d72925818c Mon Sep 17 00:00:00 2001
+From ab87d6a24bc499ab427306aafcef18569e56fbec Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 15:23:40 -0500
-Subject: [PATCH 6/7] Generator: adaptive prefill chunks
+Subject: [PATCH 06/21] Generator: adaptive prefill chunks
  (EXL3_PREFILL_ADAPTIVE, default off)
 
 Per-chunk memory limiter ported from QMesh R5 (qmesh/prefill_limit.py): shrinks each planned prefill chunk to fit free device memory. Opt-in; changes chunk boundaries and therefore long-context numerics.

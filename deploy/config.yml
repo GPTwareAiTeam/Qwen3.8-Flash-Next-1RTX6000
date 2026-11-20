@@ -1,5 +1,5 @@
 # TabbyAPI config for Qwen3.8-Flash-Next EXL3 3.18bpw_h6_ng8 on one 96 GiB RTX PRO 6000.
-# Set model_dir / draft_model_dir to where you keep the weights. The GPU is chosen in deploy/launch.sh (GPU=).
+# Set model_dir / draft_model_dir / disk_cache_dir for your machine. The GPU is chosen in deploy/launch.sh (GPU=).
 network:
   host: 127.0.0.1
   port: 5000
@@ -15,14 +15,16 @@ model:
   model_dir: /path/to/models
   model_name: Qwen3.8-Flash-Next-exl3-3.18bpw_h6_ng8
   backend: exllamav3
-  max_seq_len: 655360         # 640k per request (model supports 1M with deploy/model-config-yarn4.patch)
-  cache_size: 2999808         # 3M (multiple of 256); with 8192-token chunks keeps ~1.9 GiB free at peak
+  max_seq_len: 524032         # 512k per request minus one 256-token page for draft/verify positions (YaRN factor 2: 524,288)
+  cache_size: 2999808         # 3M (multiple of 256); the growable pool maps it as it fills (EXL3_KV_GROW)
   cache_mode: '6,6'
   tensor_parallel: false
   gpu_split_auto: false
   gpu_split: [99]
-  max_batch_size: 9           # 9th slot: +148 MiB; a new prompt does not wait for 8 long decodes
-  chunk_size: 8192            # 16384 runs out of memory at this pool
+  max_batch_size: 12          # 12 jobs on the captured paths (patch 0019) with the 64-row verify cap (EXL3_DRAFT_MAX_ROWS)
+  chunk_size: 8192
+  prefill_chunk_size: 16384   # growable KV pool + adaptive limiter: 16k chunks on an empty pool, stepping down as it fills
+  shared_chunk_size: 4096     # chunk size while other requests decode (TabbyAPI patch v3)
   ngram_ram: false            # engram table read from disk; EXL3_NGRAM_LOCK=1 pins it in RAM instead
   vision: true
   vision_offload: false
@@ -35,6 +37,7 @@ draft_model:
   draft_num_tokens: 7         # DFlash2 block of 8 = anchor + 7 drafts
   dynamic_draft: true
   draft_confidence: 0.45
+  hybrid_draft_tokens: 16     # suffix-match drafting of 16 tokens; launch.sh limits it to rounds with one active job
 
 sampling:
   override_preset: qwen38_thinking
@@ -43,3 +46,10 @@ memory:
   # Recurrent-state checkpoints for prefix-cache reuse (MB of system RAM). Each checkpoint is ~104 MiB on this model;
   # the 4096 default holds ~39, which agent workloads with many concurrent long conversations exhaust.
   sysmem_recurrent_cache: 65536
+  # Second-tier K/V cache in pinned system RAM (MB): evicted prompt pages are kept here and come back without a
+  # re-prefill. 192 GiB holds ~15M tokens at 13.5 KiB/token. Committed and page-locked at start (boot +40-50 s).
+  sysmem_kv_cache: 196608
+  # Third tier on disk: pages entering the RAM tier and recurrent checkpoints are written through and survive a
+  # restart. Put it on a fast NVMe. Size in MB.
+  disk_cache_dir: /path/to/kv-cache
+  disk_cache_size: 204800

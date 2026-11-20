@@ -1,7 +1,7 @@
-From c4f339814e567b8c872ae19a640d0f953353f855 Mon Sep 17 00:00:00 2001
+From 212168b736737946c8827a19c90a4fadb9fcbe87 Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 19:34:20 -0500
-Subject: [PATCH 10/15] Cache: growable KV pool (EXL3_KV_GROW, default off),
+Subject: [PATCH 10/21] Cache: growable KV pool (EXL3_KV_GROW, default off),
  port of the QMesh growable cache: quant K/V and QSA plane pools reserved as
  CUDA virtual ranges, physical pages mapped in 2 MiB granules as the page
  table hands pages out (lowest unbacked page first, no defrag); adaptive
@@ -413,10 +413,10 @@ index 00000000..7a423a10
 +            self.handle = 0
 +            self.mapped = 0
 diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
-index 2c986392..8e825996 100644
+index 3523ee84..941c300a 100644
 --- a/exllamav3/generator/generator.py
 +++ b/exllamav3/generator/generator.py
-@@ -275,7 +275,7 @@ class Generator:
+@@ -309,7 +309,7 @@ class Generator:
          # Single-device runs only; multi-device and TP runs keep fixed chunks
          self.prefill_chunk_limit = None
          if PREFILL_ADAPTIVE and torch.cuda.is_available() and len(self.model.active_devices) == 1:

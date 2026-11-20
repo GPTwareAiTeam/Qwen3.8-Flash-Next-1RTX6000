@@ -1,7 +1,7 @@
-From fd6a193ff1ad9f20403cc1339574d8dadd579794 Mon Sep 17 00:00:00 2001
+From 5711a34c8e28e5d0ef383ddf82fdd2e118e2678a Mon Sep 17 00:00:00 2001
 From: GPTware AI Team <dcmaxhome@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 15:07:17 -0500
-Subject: [PATCH] Diagnostics: MoE tier trace (EXL3_MOE_TIER_TRACE) and
+Subject: [PATCH 09/21] Diagnostics: MoE tier trace (EXL3_MOE_TIER_TRACE) and
  allocator stats in the adaptive prefill log;
  EXL3_PREFILL_ADAPTIVE_EMPTY_CACHE releases split blocks before measuring room
  (default off)
