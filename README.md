@@ -14,7 +14,7 @@ on a single 96 GiB RTX PRO 6000 Blackwell (SM120), with TabbyAPI, a 21-patch exl
 |12 users, code (`matrix.py`)|573.1 t/s²|**901.3 t/s**|**1.57×**|
 |8 users, code (`matrix.py`)|708.4 t/s|**881.5 t/s**|1.24×|
 |Requests served at once|9|**12**|+3|
-|1 user rewriting a ~1.5k-token file with one change|261.6 t/s|**355.9-399.9 t/s**|**+36-53 %**³|
+|1 user rewriting a ~1.5k-token file with one change|337.2 t/s³|**463.3 t/s**|**+37 %**|
 |VRAM after load|91.8 GiB (pool allocated)|**59.2 GiB** (pool mapped as it fills)|−32.6 GiB|
 |VRAM free at the run's peak|2.6 GiB|**6.9 GiB**|+4.3 GiB|
 |Cold 520k-token prompt to first token|96.6 s|**87.9 s**|1.10×|
@@ -22,7 +22,7 @@ on a single 96 GiB RTX PRO 6000 Blackwell (SM120), with TabbyAPI, a 21-patch exl
 
 ¹ V2 has no RAM or disk prompt-cache tier; the V2 column is the same prompt sent cold (measured on V3, same prefill path).
 ² V2 serves at most 9 requests at once; at 12 users, 3 wait in its queue (as measured).
-³ Two single runs at different host load (2.5 and 5.0).
+³ Same prompt, identical output text, host load ~11 on both; V3 median of 3 (405-464 t/s), V2 one run.
 
 **Since v1** (the original recipe: stock exllamav3, 8-bit KV): 8 users, code 453.7 → 881.5 t/s (1.94×); 1 user,
 code 231.1 → 313.5 t/s (1.36×).⁴
@@ -178,19 +178,38 @@ TABBY=$PWD/tabbyAPI ENGINE=$PWD/exllamav3 GPU=0 ./deploy/launch.sh
 `launch.sh` sets the engine switches, waits for the model and sends one 128-token warm-up request before serving
 (see "Server history"). Startup takes ~80-90 s: the 192 GiB RAM tier is committed and page-locked at load.
 
+## Upgrading from V2
+
+- **Model config:** restore the model's original `config.json` (or reverse V2's patch:
+  `patch -R -p1 < model-config-yarn4.patch` from V2's `deploy/`), then apply `deploy/model-config-yarn2.patch`. The two
+  patches change the same lines, so the factor-2 patch does not apply on top of factor 4.
+- **Engine and server:** check out exllamav3 `v1.6.4` again and apply this release's `engine/patches` (21 patches; they
+  replace V2's 0001-0007, not add to them). For TabbyAPI, start again from `564f8fb` and apply `deploy/tabbyapi-v3.patch`
+  in place of V2's `tabbyapi-prefill-chunk-size.patch` (V2 already offered the v3 patch as an option; if you used it,
+  keep it). Use this release's `deploy/launch.sh`: it sets the new engine
+  switches.
+- **`config.yml` keys that changed:** `max_seq_len` 655360 → 524032, `max_batch_size` 9 → 12; new: `prefill_chunk_size:
+  16384`, `shared_chunk_size: 4096`, `hybrid_draft_tokens: 16`, `sysmem_kv_cache: 196608`, `disk_cache_dir`,
+  `disk_cache_size: 204800`. `cache_size`, `chunk_size`, the drafter settings and `sysmem_recurrent_cache` are unchanged.
+- **Host:** plan for 320 GB of host RAM or more (the server holds ~250 GiB with the RAM tier; V2 ~60-120 GiB), and for a
+  start of ~80-90 s instead of ~45 s, so raise any health-check or restart timeouts.
+- **Disk tier:** create the directory before the first start, on a fast NVMe with 200 GB free, e.g.
+  `mkdir -p /path/to/kv-cache && chmod 700 /path/to/kv-cache`, and set `memory.disk_cache_dir` to it (see "Prompt
+  cache" under Details for what it stores).
+
 ## What's new in V3
 
 |Change|Ships in|Measured effect (that change alone)|
 |---|---|---|
-|12 concurrent requests: decode graphs for 12 jobs, a 64-row cap on verify rows per round, and the cap's batch-size fix|0019, 0021, `max_batch_size: 12`|12 users 1.57× V2 (`matrix.py`, code); the fix alone: 1 user math 254 → 335 t/s|
+|12 concurrent requests: decode graphs for 12 jobs, a 64-row cap on verify rows per round|0019, 0021, `max_batch_size: 12`|12 users 1.57× V2 (`matrix.py`, code)|
 |Prompt-cache RAM (192 GiB) and NVMe tiers|`memory.sysmem_kv_cache`, `disk_cache_dir`|evicted 100k prompt 16.75 → 0.43 s; after a restart 0.76 s|
 |Growable KV pool|0010-0015|VRAM after load 91.8 → 59.2 GiB|
 |Adaptive prefill chunks up to 16k + TabbyAPI patch v3|0006, 0013, 0014, `prefill_chunk_size: 16384`|cold 128k +5-9 %, 2k −3..−7 %|
-|Hyper-connection int8 tables built once|0016|8 users +9-11 %|
-|Shared expert of a wide verify window as one launch|0017|8 users +7 %|
-|Batched speculative accept (+ the no-op sampler flag fix)|0018|8 users +6-8 %|
-|Drafter's next block under the host accept loop|0021, `EXL3_SD_DRAFT_OVERLAP=1`|8 users prose +4.6 % (one run)|
-|Hybrid (suffix-match) drafting while one request is active|0021, `hybrid_draft_tokens: 16`|1 user file rewrite +36-53 % (one run each)|
+|Hyper-connection int8 tables built once|0016|8 users +9-10 %|
+|Shared expert of a wide verify window as one launch|0017|8 users +6-15 %|
+|Batched speculative accept (+ the no-op sampler flag fix)|0018|8 users +4-7 %|
+|Drafter's next block under the host accept loop|0021, `EXL3_SD_DRAFT_OVERLAP=1`|8 users within noise (prose +2.2 %, code −0.6 %)|
+|Hybrid (suffix-match) drafting while one request is active|0021, `hybrid_draft_tokens: 16`|1 user file rewrite +20 % against V3 with it off|
 |Counting-sort run table for wide verify windows|0020|rotation launch 50-60 → 8-9 µs|
 |YaRN factor 4 → 2, 512k per request|`deploy/model-config-yarn2.patch`|1 / 2 / 8 users +0.6 / +3.6 / +4.2 %|
 |Bench: first-token timing, release benchmark, needle, prompt-cache and chat exact-answer probes; gate policy|`bench/`|—|
@@ -202,9 +221,10 @@ Numerics, switches and the measurements behind each row: `engine/README.md` and 
 
 - **Host RAM ~250 GiB** for the 192 GiB prompt-cache RAM tier; lower or zero `sysmem_kv_cache` on a smaller host.
 - **Rounding-level drift**: greedy text differs from V2 at near-tie tokens; next-token top-1 25/25, KL 0.001-0.002.
-- **512k per request** instead of 640k (YaRN factor 2); factor 4 restores 640k+ at some single-user speed.
+- **512k per request** instead of 640k (YaRN factor 2); factor 4 restores 640k+ at ~4 % lower throughput at 2-8 users
+  (no measurable difference at 1 user).
 - **Cold 2k prefill 3-7 % slower** (0.57 → 0.59-0.62 s); long prompts gain.
-- **Per-user speed above 8 users** falls (12 users: 69 t/s each) while total throughput rises.
+- **Per-user speed at 12 users** is 69 t/s (V2: 47); it is lower than at 8 users, as on any server.
 - **Slower start**: ~80-90 s to ready (V2 ~45 s), the RAM tier is page-locked at load.
 
 Details for each: `docs/measurements.md`.
@@ -218,7 +238,7 @@ positions.
 **Context length.** `deploy/model-config-yarn2.patch` applies static YaRN factor 2 (524,288 positions);
 `max_seq_len: 524032` leaves one 256-token page for the draft and verify positions of a request at the limit
 (drafts are up to 16 tokens with hybrid drafting). V2 used factor 4 (1,048,576 positions, 640k per request); the
-smaller factor drafts slightly better because the drafter was trained without YaRN (`docs/measurements.md`,
+smaller factor drafts slightly better, likely because the drafter was trained without YaRN (`docs/measurements.md`,
 "YaRN factor 4 → 2").
 
 **KV capacity.** 6-bit K/V costs 13.5 KiB per token; 3.75 KiB of that is fixed fp16 planes for the sparse-attention
@@ -235,11 +255,18 @@ from the GPU pool moves to RAM; pages entering RAM, and the recurrent checkpoint
 weights, so a config change (such as the YaRN factor) starts a fresh subdirectory. 197 checkpoints were held after a
 3.1M-token fill test, well inside the 64 GiB budget.
 
+Privacy: the RAM and disk tiers hold the KV of users' prompts, and the disk tier keeps it across restarts. Put
+`disk_cache_dir` on storage only the server's account can read, and clear it (stop the server, delete the directory's
+contents) when prompts must not persist, for example after a tenant leaves a multi-tenant setup. `sysmem_kv_cache: 0`
+and no `disk_cache_dir` turn both tiers off.
+
 **Drafting.** DFlash2 drafts 8-token blocks: the first position of a block is the anchor (the last accepted token),
 so a block carries 7 drafts, and `draft_num_tokens: 7` uses all of them. Draft acceptance drives single-stream
-speed: about 4-5 accepted drafts per round on code and math, 1-2 on prose and chat. With one active request, a
+speed: about 4-5 accepted drafts per round on code and math sent as plain prompts, 1-2 on prose and chat. Sent as
+chat messages with thinking on, the same code prompt drops to ~1.6-1.9 (the reply opens with free-form reasoning),
+while math stays at ~4.5-4.8. With one active request, a
 16-token suffix match against the request's own context (hybrid drafting) replaces the DFlash2 block when the match
-is long and agrees with it: rewriting a file with one small change accepts ~990 of 1,068 tokens.
+is long and agrees with it: rewriting a file with one small change accepts 991 of 1,068 tokens (929 without it).
 
 **Engram table.** 48.3 GiB of n-gram embeddings read per token. Locked in RAM it costs 48.3 GiB of host memory
 and removes disk reads from the critical path. Streamed from disk (`EXL3_NGRAM_LOCK=0`) it uses ~4 GiB RSS, but a
@@ -277,7 +304,8 @@ what the server has decoded since start (near-tie tokens; batched KL 0.0015). V2
 4096-token chunk every fifth generator step. With four users decoding, a cold 131k prompt reaches its first token
 in 35 s and the decoders run at about a fifth of their speed meanwhile. TabbyAPI patch v3
 (`deploy/tabbyapi-v3.patch`) exposes the two knobs: `prefill_cooldown` (steps between chunks)
-and `shared_chunk_size`. Measured, 4 decoders + one cold 131k prompt:
+and `shared_chunk_size`. Measured on the V2-era build (2026-11-15, before V3's decode changes), 4 decoders + one
+cold 131k prompt:
 
 |`prefill_cooldown` / `shared_chunk_size`|time to first token|decoders during the prefill|
 |---|---|---|
@@ -309,23 +337,50 @@ See `bench/README.md` for each script, the timing definitions and the gate polic
 
 ## Credits
 
-- **Qwen3.8-Flash-Next**: Qwen team, Alibaba. Qwen Community License 1.0; weights are not redistributed here.
-- **exllamav3**: turboderp and contributors, MIT. EXL3 format, kernels, DFlash2 support; V2's patches 0004, 0005
-  and 0007 extend its coop MoE kernels, CUDA-graph machinery and DFlash2 generator.
-- **TabbyAPI**: theroyallab and contributors, AGPL-3.0.
-- **DFlash2 drafter**: Inco AI / z-lab, Apache-2.0.
-- **flash-linear-attention**: Songlin Yang et al., MIT.
-- **QMesh R5** exllamav3 fork (GPTwareAiTeam, MIT), on which V2 builds: the cooperative MoE k-loop (0001), the dense
-  decode GEMV (0002), the readback-free fused MoE dispatch (0003) and the adaptive prefill limiter (0006) are ported
-  from it, as is the A, A, B, B / next-token-KL measurement method used for every number here. The growable KV pool
-  (patches 0010-0015) ports its growable cache: `cache/native/vmm_pool.cpp` and the `VmmRange` wrapper on CUDA
-  virtual memory management.
-  <https://github.com/GPTwareAiTeam/QMesh-1xRTXPro6000-1xGB10>
+Models and code this recipe runs on, v1 to V3:
 
-V3's own items and what each owes to that fork (0008, 0009, 0010-0015, 0020, and 0004/0005, which V2's credits did
-not name): `docs/provenance.md`. No code from TensorFold, MiaAI-Lab or z-lab is in the patches; hybrid drafting and
-the DFlash2 drafter code are upstream exllamav3, and `deploy/tabbyapi-v3.patch` plus the new bench scripts are this
-repository's own work.
+- **Qwen3.8-Flash-Next** ([model](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)): Qwen team, Alibaba. Qwen
+  Community License 1.0; weights are not redistributed here.
+- **The EXL3 quant**, [`turboderp/Qwen3.8-Flash-Next-exl3`, branch `3.18bpw_h6_ng8`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3/tree/3.18bpw_h6_ng8):
+  turboderp ([@turboderp_](https://x.com/turboderp_)). Every number in this repository, v1 included, was measured on
+  it. It is one of the model card's self-calibrated quants, made with exllamav3's
+  [self-calibration pipeline](https://github.com/turboderp-org/exllamav3/blob/master/doc/optimize.md) (per-tensor
+  bitrates solved from measured sensitivities), not a standard `convert.py --bits` conversion.
+- **exllamav3** ([GitHub](https://github.com/turboderp-org/exllamav3)): turboderp and contributors, MIT. EXL3 format,
+  kernels, DFlash2 support and the self-calibration pipeline; V2's patches 0004, 0005 and 0007 extend its coop MoE
+  kernels, CUDA-graph machinery and DFlash2 generator.
+- **TabbyAPI** ([GitHub](https://github.com/theroyallab/tabbyAPI)): kingbri ([@kingbri1st](https://x.com/kingbri1st))
+  and contributors, theroyallab, AGPL-3.0.
+- **DFlash2 drafter** ([`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)):
+  Inco AI ([@inco_ai](https://x.com/inco_ai)), Apache-2.0, building on [DFlash](https://github.com/z-lab/dflash)
+  (z-lab) by Jian Chen ([@jianchen1799](https://x.com/jianchen1799)), Yesheng Liang and Zhijian Liu
+  ([@zhijianliu](https://x.com/zhijianliu)).
+- **flash-linear-attention** ([GitHub](https://github.com/fla-org/flash-linear-attention)): Songlin Yang
+  ([@SonglinYang4](https://x.com/SonglinYang4)), Yu Zhang ([@yzhang_cs](https://x.com/yzhang_cs)) et al., MIT.
+- **YaRN** ([paper](https://arxiv.org/abs/2309.00071)): Bowen Peng, Jeffrey Quesnelle
+  ([@theemozilla](https://x.com/theemozilla)) et al. The context-extension method behind the model-config patch: v1
+  and V2 run factor 4, V3 factor 2.
+- **QMesh R5** exllamav3 fork ([GitHub](https://github.com/GPTwareAiTeam/QMesh-1xRTXPro6000-1xGB10), GPTwareAiTeam,
+  MIT), on which V2 builds: the cooperative MoE k-loop (0001), the dense decode GEMV (0002), the readback-free fused
+  MoE dispatch (0003) and the adaptive prefill limiter (0006) are ported from it, as is the A, A, B, B /
+  next-token-KL measurement method used for every number here. The growable KV pool (patches 0010-0015) ports its
+  growable cache: `cache/native/vmm_pool.cpp` and the `VmmRange` wrapper on CUDA virtual memory management. What
+  each V3 item owes to it (0008, 0009, 0010-0015, 0020, and 0004/0005, which V2's credits did not name):
+  `docs/provenance.md`.
+
+Hybrid drafting and the DFlash2 drafter code are upstream exllamav3; `deploy/tabbyapi-v3.patch` and the bench
+scripts are this repository's own work.
+
+**Reference points** (not code credits: none of their code is in this repository). Public recipes and benchmarks
+we compared against, or that shaped what we tested:
+- [Mia's AI Lab](https://x.com/MiaAI_lab): the Flash-Next recipes on TensorFold, e.g.
+  [Qwen3.8 Flash Next on one RTX PRO 6000](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-RTX-PRO-6000-TernsorFold)
+  and the [TensorFold Flash-Next recipe](https://github.com/MiaAI-Lab/TensorFold/blob/main/docs/recipes/qwen3.8-flash-next.md);
+  [TensorFold](https://github.com/ashhart/TensorFold) itself is by Ash Hart ([@ashxhart](https://x.com/ashxhart)).
+- bertholomus ([@bertholomusai](https://x.com/bertholomusai)):
+  [Qwen3.8-Flash-Next-NVFP4-GPTQ](https://huggingface.co/bertholomus/Qwen3.8-Flash-Next-NVFP4-GPTQ).
+- turboderp's KL-divergence and perplexity charts for the EXL3 quants against other formats, on the
+  [model card](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3).
 
 ## License
 

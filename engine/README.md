@@ -40,7 +40,7 @@ sets the switches in the last column.
 Patches 0001, 0002, 0003, 0004, 0006, 0008 and the growable pool (0010, 0013) port or adapt work from the exllamav3
 fork behind [QMesh R5](https://github.com/GPTwareAiTeam/QMesh-1xRTXPro6000-1xGB10) (MIT), as do the graph segments of
 0005 and the tier-trace switch of 0009; `exllamav3/cache/native/vmm_pool.cpp` is taken from it unchanged. Per-item
-detail (copied, modified or idea only) is in the README's Credits. The patches are MIT, like exllamav3.
+detail (copied, modified or idea only) is in `docs/provenance.md`. The patches are MIT, like exllamav3.
 
 ## Numerics
 

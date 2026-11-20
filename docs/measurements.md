@@ -52,7 +52,54 @@ Ratios quoted in the README's "V3 at a glance", computed from the numbers in thi
 39×, after restart 16.75 / 0.76 = 22×; `matrix.py` code 12 users 901.3 / 573.1 = 1.57×, 8 users 881.5 / 708.4 =
 1.24× (+24.4 %), math 8 users 805.2 / 684.7 = +17.6 %; VRAM after load 91.8 − 59.2 = 32.6 GiB less; 520k 96.6 / 87.9
 s = 1.10× (+9.8 % in t/s); prefill V2 → V3 in t/s, 2k 3,541 → 3,438 (−2.9 %, "−3 %"), 32k 5,695 → 5,933 (+4.2 %), 128k
-5,683 → 6,038 (+6.2 %); `matrix.py` 12 users code +57.3 %, math +50.9 %; since v1, 8 users code 881.5 / 453.7 = 1.94×, 1 user 313.5 / 231.1 = 1.36×.
+5,683 → 6,038 (+6.2 %), 520k 5,385 → 5,915 (520,163 tokens in 96.6 s; 520,174 in 87.9 s); `matrix.py` 12 users code
++57.3 %, math +50.9 %; since v1, 8 users code 881.5 / 453.7 = 1.94×, 1 user 313.5 / 231.1 = 1.36×.
+
+### Current-build re-measure (2026-11-20 15:14-15:30)
+
+Every drafting-sensitive V3 number in the README comes from the current build (the shipped V3, on the reference
+server since 2026-11-19 22:32, after the verify-row-cap fix) or from this section. One boot per arm, the shipped
+launcher and config with one setting changed, 3 runs each, fixed nonces (identical prompts across arms). Host load
+recorded per arm (another process on the host), not voided.
+
+**File rewrite, 1 user** (one chat request: rewrite a ~1.5k-token Python file with one rename, greedy, 1,536 max tokens;
+1,068 tokens generated in every run; output text byte-identical across all arms, V2 included):
+
+|arm|t/s, 3 runs|median|accepted drafts|load|
+|---|---|---|---|---|
+|V3, hybrid drafting on (live config, `hybrid_draft_tokens: 16`)|405.2 / 463.3 / 463.6|**463.3**|991|10.5-10.7|
+|V3, hybrid drafting off (`hybrid_draft_tokens: 0`)|376.8 / 385.6 / 385.0|385.0|929|10.3-12.4|
+|V2 (tag v2.0, one boot, one run, 14:50)|337.2|337.2|930|11.4|
+
+Hybrid drafting on → off: 463.3 / 385.0 = **+20.3 %**. V3 against V2: 463.3 / 337.2 = **+37.4 %** (+20.2 % at V3's
+slowest run, 405.2). V2's single run was at the same host load as V3's.
+
+**8 users, prose and code** (8 concurrent copies of the `final.py` prompt, 512 forced tokens each, greedy,
+total t/s send to last token), aggregate t/s, 3 runs and median:
+
+|arm|prose|median|code|median|load|
+|---|---|---|---|---|---|
+|all on (live)|411.8 / 505.6 / 427.7|427.7|725.6 / 757.9 / 757.9|757.9|11.9-12.8|
+|drafter / accept overlap off (`EXL3_SD_DRAFT_OVERLAP=0`)|419.7 / 418.3 / 402.9|418.3|764.8 / 749.4 / 762.4|762.4|6.3-9.9|
+|hyper-connection tables off (`EXL3_HC_TABLE_CACHE=0`)|389.5 / 395.5 / 374.2|389.5|695.4 / 703.8 / 693.7|695.4|5.9-6.5|
+|wide shared expert off (`EXL3_MOE_SHARED_WIDE=0`)|388.6 / 366.9 / 370.5|370.5|698.4 / 715.7 / 760.4|715.7|8.7-9.1|
+|batched accept off (`EXL3_SD_BATCH_ACCEPT=0`, overlap off as it needs it)|393.3 / 403.8 / 432.2|403.8|715.9 / 690.5 / 712.6|712.6|10.5-12.1|
+
+Effect of each switch (on against off, medians): overlap prose 427.7 / 418.3 = +2.2 %, code 757.9 / 762.4 = −0.6 %
+(within the run spread: no measurable effect at 8 users); hyper-connection tables (0016) prose +9.8 %, code +9.0 %;
+wide shared expert (0017) prose +15.4 %, code +5.9 %; batched accept (0018, against the overlap-off arm) prose +3.6 %,
+code +7.0 %. Single boots with prose runs spreading up to ±12 %, so these are approximate.
+
+### Draft acceptance, plain prompt against chat form (live V3, 2026-11-20)
+
+The `final.py` code and math prompts, 512 forced tokens, greedy, 3 runs each, sent once as plain completions and once
+as chat messages (the model's template, thinking on); accepted drafts per decode round = accepted / (tokens −
+accepted). Host load 10.4-11.1.
+
+|prompt|plain|chat, thinking on|
+|---|---|---|
+|code|4.39 / 4.39 / 4.45 (265-284 t/s)|1.63 / 1.75 / 1.94 (157-167 t/s)|
+|math|4.63 / 4.69 / 4.57 (296-303 t/s)|4.45 / 4.75 / 4.75 (235-290 t/s)|
 
 Charts in the README (`docs/img/*.svg`) are drawn from this section by `docs/img/make_charts.py` from
 `docs/img/chart_data.json`.
@@ -63,6 +110,46 @@ v1 = stock exllamav3 1.6.4 with 8-bit KV, the same model, drafter and TabbyAPI. 
 `bench/matrix.py` (code prompt, 512-token greedy replies, send to last token, total t/s, median of 3): 1 user 231.1,
 8 users 453.7 t/s. V3 on the same harness and prompt, 2026-11-20 (section "V3 as shipped ... README sections",
 `matrix.py` paragraph): 1 user 313.5, 8 users 881.5 t/s. Separate sessions; same card and harness.
+
+## README number audit (2026-11-20)
+
+Every number in the README, with when and how it was measured. "Current build" = the shipped V3, live since
+2026-11-19 22:32 after the verify-row-cap fix. The fix changed how many drafts each round verifies, so a speed number measured from the moment the cap went live (2026-11-19 10:21) until 22:32 is
+drafting-sensitive and stale. Numbers that do not depend on drafting (prefill, VRAM, host memory, kernel
+microbenchmarks, quality) are valid from any build that ships the code they describe. V2 = tag v2.0. Hardware and
+install facts (card, RAM sizing, revisions, config values, patch counts) are configuration, not measurements, and are
+not listed.
+
+|README number(s)|section|measured (EST)|build|harness|drafting-sensitive?|
+|---|---|---|---|---|---|
+|matrix.py 1 / 8 / 12 users, code and math, V2 and V3 (313.0-901.3 t/s, 1.24×, 1.57×, +57.3 / +50.9 %)|at a glance, Measured|11-20 03:06-03:13|current build; V2|`bench/matrix.py`, one boot per release, median of 3|yes, current build|
+|Per prompt type, 1-12 users, V2 and V3 total and per user; geomeans (+4.9 … +75.9 %); per-user 69 vs 47 at 12 users|Measured, Trade-offs, Details (admission)|11-20 10:34-11:03|current build; V2|`bench/final.py` decode, one boot per release, median of 3|yes, current build|
+|File rewrite, 1 user: V3 463.3 t/s, V2 337.2 t/s (+37 %); hybrid on/off +20 % (385.0 → 463.3); accepted 991 / 929 of 1,068|at a glance, What's new, Details (drafting)|11-20 15:14-15:18 (V3), 14:50 (V2)|current build; V2|file-rewrite request (fixed prompt), one boot per arm, 3 runs (V2 1 run)|yes, current build|
+|8 users: overlap within noise (+2.2 / −0.6 %), 0016 +9-10 %, 0017 +6-15 %, 0018 +4-7 %|What's new|11-20 15:17-15:30|current build|8 concurrent `final.py` prompts, one boot per arm, 3 runs|yes, current build|
+|Draft acceptance 4-5 per round plain code/math, 1-2 prose/chat; chat form code 1.6-1.9, math 4.5-4.8|Details (drafting)|11-20 10:42 (plain, README run) and 14:56 (chat form)|current build|`bench/final.py` acceptance counts; chat/completions probe, 3 runs|yes, current build|
+|YaRN factor 4 → 2: 1 / 2 / 8 users +0.6 / +3.6 / +4.2 %; "~4 % lower at 2-8 users"|What's new, Trade-offs|11-20 01:17-01:38|current build at factor 4 vs 2|`bench/final.py`, A,A,B,B, 3 runs per boot|yes, current build|
+|One request, 2048 tokens, V2 and V3, greedy and preset (123.4-329.3 t/s)|Measured|11-20 03:32-03:44|current build; V2|`bench/decode_natural.py`, one boot per release, median of 3|yes, current build|
+|Since v1: 8 users 453.7 → 881.5 (1.94×), 1 user 231.1 → 313.5 (1.36×)|at a glance|v1 11-14; V3 11-20 03:09|v1 recipe; current build|`bench/matrix.py`|yes: V3 side current build; v1 side is the v1 recipe (no row cap)|
+|Prefill V3 2k 0.59 s / 3,438 t/s, 128k 21.7 s / 6,038 t/s|Measured|11-20 10:42-11:00|current build|`bench/final.py` prefill, fresh nonce, 3 runs|no (prefill)|
+|Prefill V2 2k 0.57 s / 3,541 t/s, 128k 23.1 s / 5,683 t/s|Measured (footnote 6), Trade-offs|11-19 19:00-20:42|V2|`bench/final.py` prefill, A,A,B,B|no (prefill, V2)|
+|Prefill 32k V2 5.53 s / V3 5.31 s (+4.2 %); worst of 5 cold 32k 5.61 s (median 5.19 s)|Measured|11-20 03:06-03:13 and 03:32-03:44|current build; V2|`bench/coldttft.py`|no (prefill)|
+|520k cold prompt V2 96.6 s / V3 87.9 s (1.10×, +9.8 %); needle retrieved|at a glance, Measured, Quality|V2 11-19 19:00-20:42; V3 11-20 03:55-04:00|V2; current build|`bench/needle.py`|no (prefill)|
+|Cold 2k prefill 0.62 s (release run, "3-7 % slower")|Trade-offs|11-19 19:48-20:42|V3 bug-window build|`bench/final.py` prefill, A,A,B,B|no (prefill: the row cap acts on decode only)|
+|Prompt cache 100k: cold 16.75 s, hot 0.18 s, evicted 0.43 s, after restart 0.76 s; 99,840 of 99,997 cached; 39× / 22×|at a glance, Measured, What's new|11-20 10:42-11:03|current build|`bench/prompt_cache.py`|no (prefill / cache)|
+|VRAM after load V2 91.8 / V3 59.2 GiB; free at peak 2.6 / 6.9 GiB|at a glance, What's new|11-20 10:34-11:03|current build; V2|`nvidia-smi` sampling in the run|no (memory)|
+|Host RAM ~250 GiB (RSS 244-268 GiB), V2 ~60-120 GiB; start ~80-90 s, V2 ~45 s|What it takes, Upgrading, Trade-offs|11-19 19:00-20:42 and every boot since|V3 bug-window build and current build; V2|server RSS, boot logs|no (memory, start time)|
+|Exact-answer probe 50/50 both releases|at a glance, Quality|11-20 08:18-08:21|current build; V2|`bench/accuracy.py`|no (quality; drafting is lossless)|
+|Top-1 25/25, KL 0.0010-0.0014 short / 0.0018 long, floor 0.0004 / 0.0000; factor 2 vs 4 top-1 16/16, KL 0.015|Quality, Trade-offs|11-19 19:00-20:42; 11-20 01:17-01:38|V3 bug-window build; current build|`bench/identity_kl.py`|no (quality: next-token distributions do not depend on how many drafts are verified)|
+|Adaptive prefill chunks: cold 128k +5-9 %, 2k −3..−7 %|What's new|11-16 00:12-00:44 (A,A,B,B against V2) and 11-19 19:00-20:42|V3 candidate build; bug-window build|`bench/final.py` prefill|no (prefill)|
+|Counting-sort run table: rotation launch 50-60 → 8-9 µs|What's new|11-19 11:00-12:40|microbenchmark|kernel microbenchmark|no (kernel microbenchmark)|
+|Prefill while others decode: 35 s / −80 %, 86 / 41 / 25 s, −30 / −71 / −96 %|Details|11-15|V2-era build (labelled)|`bench/prefill_under_load.py`|yes, but labelled as V2-era; predates every V3 decode change, not the bug window|
+|Prefix cache under agent load: 39 / ~640 checkpoints, 104 MiB, 93-99 % / 2-10 % / 77 % from cache, 2 s median queue; 197 checkpoints after the fill|Details|11-14 (V2 live traffic, before and after the checkpoint-budget fix); 197 on 11-19 17:28-17:42|V2; V3 tier build|server journal; fill test|no (cache capacity and hit rates)|
+|Server history: first ~74 tokens, batched KL 0.0015|Details|11-12 (V2.1 era)|V2|`bench/identity_kl.py` probes|no (numerics of the drafter/target, not the draft width)|
+|Model facts: 48 layers, 512 experts, 262,144 positions; KV 13.5 / 3.75 KiB per token; 6.3M tokens for 12 full requests; engram 48.3 GiB, ~4 GiB streamed|Details, What it takes|model config; computed|—|—|no (configuration / arithmetic)|
+
+Drafting-sensitive numbers from the bug window (2026-11-19 10:21-22:32) left in the README: **none**. The ones it had
+(file-rewrite baseline 261.6 and 399.9 t/s, the hybrid +36-53 %, overlap +4.6 %, 0016 +9-11 %, 0017 +7 %, 0018 +6-8 %,
+the fix's 254 → 335 t/s) are replaced by the current-build re-measure above or removed.
 
 ## Trade-offs, in detail
 
@@ -75,13 +162,16 @@ v1 = stock exllamav3 1.6.4 with 8-bit KV, the same model, drafter and TabbyAPI. 
   text differs from V2 on 3-5 of the 8 identity prompts at near-tie tokens (V2 against itself: 7/8; V3 against
   itself: 6/8); next-token top-1 stays 25/25 and KL 0.001-0.002 ("V3 release run", quality table).
 - **YaRN factor 2.** 512k per request instead of 640k. The model was trained at 262,144 positions and the drafter
-  without YaRN, so the smaller factor drafts slightly better ("YaRN factor 4 → 2"). For longer single requests, edit
+  without YaRN, likely why the smaller factor drafts slightly better ("YaRN factor 4 → 2"). Factor 4 against factor 2
+  there: 1 user 213.7 / 215.0 = −0.6 % (within run-to-run spread), 2 users 339.3 / 351.5 = −3.5 %, 8 users 571.4 /
+  595.1 = −4.0 %; the README's "~4 % lower at 2-8 users". For longer single requests, edit
   the patched model config.json to `"factor": 4.0` and `"max_position_embeddings": 1048576`, and raise `max_seq_len`
-  to 655,360 or more (V2's setting); single-user speed then drops by up to the factor-2 gain.
+  to 655,360 or more (V2's setting).
 - **Cold 2k prefill.** 0.57 s (V2) → 0.62 s (release run, A, A, B, B) / 0.59 s (README run): the adaptive limiter
   queries free memory before each chunk. Prompts from 32k up gain 4-10 %.
 - **Above 8 users.** The 64-row verify cap shares the draft budget: 8 requests keep 7 drafts per round, 9-12 get
-  6-4, so per-user speed falls (README run: 8 users 86.3, 12 users 69.2 t/s per user) while total throughput rises.
+  6-4, so per-user speed falls (README run: 8 users 86.3, 12 users 69.2 t/s per user; V2 at 12 users 47.4, with 3 of
+  the 12 waiting in its queue) while total throughput rises.
 - **Start time.** ~80-90 s from launch to ready (V2 ~45 s): the 192 GiB RAM tier is committed and page-locked at load.
 
 ## V3 release run (2026-11-19 / 20)
@@ -273,8 +363,8 @@ continuation-format artefacts: asked as questions, both releases answer `1000` a
 
 |change|result|
 |---|---|
-|drafter / accept overlap (`EXL3_SD_DRAFT_OVERLAP`)|8 users prose 456.7 → 477.9, code 772.0 → 781.5 t/s; 8-user greedy output identical to the build without it (8/8)|
-|hybrid drafting with one active request (`EXL3_HYBRID_SOLO`, 16 tokens)|1 user rewriting a ~1.5k-token file with one change: 261.6 → 399.9 t/s (load 2.5), 355.9 after the row-cap fix (load 5.0); 8 users unchanged (accepted / rejected drafts 6,827 / 65 vs 6,823 / 61): stays off|
+|drafter / accept overlap (`EXL3_SD_DRAFT_OVERLAP`)|8-user greedy output identical to the build without it (8/8); speed on the current build: "Current-build re-measure" (within noise)|
+|hybrid drafting with one active request (`EXL3_HYBRID_SOLO`, 16 tokens)|off with 2+ requests: 8-user accepted / rejected drafts unchanged (6,827 / 65 vs 6,823 / 61); 1-user speed on the current build: "Current-build re-measure"|
 |counting-sort run table (`EXL3_MOE_COOP_FAST_RUNS`)|rotation launch 51 / 59 → 8.0 / 9.1 µs at 56 / 64 verify rows; outputs bit-identical|
 |split down-stage reduction (`EXL3_MOE_COOP_SPLIT_B`)|kernel faster in isolation, slower end to end at 8 users (−1..−8 %): off|
 |8-warp coop blocks|down stage −24 % in isolation, 8 users −4..−8 % end to end: not used|
@@ -289,13 +379,13 @@ the headline tables measure the whole set against V2. "8 users" = 8 concurrent r
 
 |Improvement|Where|Measured effect|Numerics|
 |---|---|---|---|
-|Hyper-connection int8 tables built once at load instead of on every call of the tiled GatedResidual mix (above 8 rows)|0016, `EXL3_HC_TABLE_CACHE=1`|8 users +9-11 %; +1.3 GiB VRAM|bit-identical|
-|Shared expert of a wide verify window (more than 8 rows) as one launch instead of 8-row graph pieces|0017, `EXL3_MOE_SHARED_WIDE=1`|8 users +7 %|rounding-level (one GEMM tiles differently: max abs diff 4e-5..2e-4 in the MoE output)|
-|Batched speculative accept: one readback per round for all requests, recurrent-state rewinds settled in one batch. Includes the sampler fix: TabbyAPI's no-op penalty steps marked every sampler as needing past tokens, which had kept the batched readback (0008) from ever engaging; the flag now comes from the steps that survive simplification|0018, `EXL3_SD_BATCH_ACCEPT=1`|8 users +6-8 %|lossless|
-|Drafter's next block launched under the host accept loop; checked next round and rolled back when the round ended differently|0021, `EXL3_SD_DRAFT_OVERLAP=1`|8 users prose +4.6 %, code +1.2 % (one run); 8-user greedy output identical with and without it|lossless|
+|Hyper-connection int8 tables built once at load instead of on every call of the tiled GatedResidual mix (above 8 rows)|0016, `EXL3_HC_TABLE_CACHE=1`|8 users prose +9.8 %, code +9.0 % (current build, one boot per arm); +1.3 GiB VRAM|bit-identical|
+|Shared expert of a wide verify window (more than 8 rows) as one launch instead of 8-row graph pieces|0017, `EXL3_MOE_SHARED_WIDE=1`|8 users prose +15.4 %, code +5.9 % (current build, one boot per arm)|rounding-level (one GEMM tiles differently: max abs diff 4e-5..2e-4 in the MoE output)|
+|Batched speculative accept: one readback per round for all requests, recurrent-state rewinds settled in one batch. Includes the sampler fix: TabbyAPI's no-op penalty steps marked every sampler as needing past tokens, which had kept the batched readback (0008) from ever engaging; the flag now comes from the steps that survive simplification|0018, `EXL3_SD_BATCH_ACCEPT=1`|8 users prose +3.6 %, code +7.0 % (current build, one boot per arm)|lossless|
+|Drafter's next block launched under the host accept loop; checked next round and rolled back when the round ended differently|0021, `EXL3_SD_DRAFT_OVERLAP=1`|8 users prose +2.2 %, code −0.6 % (current build, one boot per arm): within noise; 8-user greedy output identical with and without it|lossless|
 |Counting-sort build of the run table for wide verify windows (replaces a per-slot rank loop)|0020, `EXL3_MOE_COOP_FAST_RUNS=1`|rotation launch 50-60 → 8-9 µs at 56-64 verify rows (~2 ms per 8-user round); end-to-end within noise|bit-identical|
-|12 concurrent requests: batched-cache decode graphs for 12 jobs, a 64-row cap on verify rows per round so 9-12 requests stay on the captured 64-row paths, and the cap's fix (it had read the batch size from the draft buffer's height, which cut every round to 4 drafts at any load)|0019, 0021, `max_batch_size: 12`, `EXL3_DRAFT_MAX_ROWS=64`|9 users with the cap against 8 slots + 1 queued: code +14-18 %, prose +21 %; 12 users 1.57× V2 on `matrix.py` code, +75.9 % on the four-prompt mean (README run); the fix: 1 user math 254 → 335 t/s (one run each; 93 instead of 124 rounds per 512 tokens on identical text)|lossless (draft width only)|
-|Hybrid (suffix-match) drafting of 16 tokens while exactly one request is active (a request repeating its own context drafts from it)|0021, `hybrid_draft_tokens: 16`, `EXL3_HYBRID_SOLO=1`|1 user rewriting a ~1.5k-token file with one change: +36-53 % (one run each, 262 → 356-400 t/s); off with 2+ requests (8-user draft counts unchanged)|lossless|
+|12 concurrent requests: batched-cache decode graphs for 12 jobs, a 64-row cap on verify rows per round so 9-12 requests stay on the captured 64-row paths, and the cap's fix (it had read the batch size from the draft buffer's height, which cut every round to 4 drafts at any load)|0019, 0021, `max_batch_size: 12`, `EXL3_DRAFT_MAX_ROWS=64`|12 users 1.57× V2 on `matrix.py` code, +75.9 % on the four-prompt mean (README run, current build)|lossless (draft width only)|
+|Hybrid (suffix-match) drafting of 16 tokens while exactly one request is active (a request repeating its own context drafts from it)|0021, `hybrid_draft_tokens: 16`, `EXL3_HYBRID_SOLO=1`|1 user rewriting a ~1.5k-token file with one change: +20.3 % against V3 with it off (385.0 → 463.3 t/s), +37.4 % against V2 (337.2 t/s); off with 2+ requests (8-user draft counts unchanged)|lossless|
 |Growable KV pool: the 3M-token pool is reserved as CUDA virtual memory, mapped in 256-page steps as requests use it and released from the top when the queue drains|0010-0015, `EXL3_KV_GROW=1`|VRAM after load 91.8 → 59.2 GiB (README run; 93.9 → 60.7 GiB in the release run); the free memory goes to prefill (next row)|lossless (same pages, mapped on demand)|
 |Adaptive prefill chunks up to 16k tokens, sized to the free memory the growable pool leaves; TabbyAPI patch v3 adds `prefill_chunk_size`, `shared_chunk_size` (4096 while other requests decode) and `prefill_cooldown` (pacing; default kept)|0006 (V2, now on), 0010, 0013, 0014, `EXL3_PREFILL_ADAPTIVE=1`, `prefill_chunk_size: 16384`, `shared_chunk_size: 4096`, `deploy/tabbyapi-v3.patch`|cold 32k +6-8 %, 128k +5-9 %; cold 2k −2..−7 %|rounding-level (chunk boundaries move with free memory); long-context KL 0.0016|
 |Prompt-cache tiers: evicted prompt pages kept in 192 GiB of pinned RAM and written through to NVMe, where a restarted server finds them|config `memory.sysmem_kv_cache`, `disk_cache_dir`, `disk_cache_size` (stock TabbyAPI / exllamav3 settings)|100k-token prompt evicted from VRAM: 16.75 s → 0.43 s; after a restart: 0.76 s (README run; 0.44 / 0.87 s in the release run)|bit-identical (cached pages)|

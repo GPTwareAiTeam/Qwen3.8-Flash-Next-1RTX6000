@@ -1,7 +1,8 @@
 # V3 provenance
 
-V2's credits (README, "Credits") are unchanged. For the code new in V3, per item, where it comes
-from and how it was used. Items not listed have no outside source.
+The README's "Credits" cover v1, V2 and V3, with the public recipes and benchmarks we compared against listed
+separately as reference points. This file details the code new in V3: per item, where it comes from and how it was
+used. Items not listed have no outside source.
 
 |V3 item|source|how it was used|
 |---|---|---|
@@ -14,6 +15,7 @@ from and how it was used. Items not listed have no outside source.
 |0005 `exllamav3/util/segment.py` (CUDA-graph segments, shipped in V2 and used again by V3's graphs)|QMesh R5, MIT|base, modified: R5's `Segment` class and capture-stream handling; added labels, parameter signatures, a second warm call and the `EXL3_SEG_CHECK` / `EXL3_SEG_MEMLOG` checks. Not named in V2's credits|
 |0004 wide coop rows on verify windows (`EXL3_MOE_COOP_ROWS`, shipped in V2)|QMesh R5, MIT|base, modified: R5's switch (8-48 rows) raised to 64 rows / 640 slots, verify forwards only. Not named in V2's credits|
 
-No code from TensorFold, MiaAI-Lab or z-lab is in the patches. Hybrid (suffix-match) drafting, which 0021 limits to
+No code from TensorFold, Mia's AI Lab, bertholomus or z-lab is in the patches (the first three are reference points
+in the README, z-lab's DFlash is credited for the drafter model). Hybrid (suffix-match) drafting, which 0021 limits to
 a single active request, is upstream exllamav3. DFlash2 drafter code is upstream exllamav3 as well; 0005 only wraps
 its layer stack in a CUDA graph. `deploy/tabbyapi-v3.patch` and the new bench scripts are this repository's own work.
