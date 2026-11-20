@@ -1,0 +1,45 @@
+{
+ "throughput": {
+  "title": "Total decode throughput, V2 vs V3 (geometric mean of 4 prompt types)",
+  "users": [
+   1,
+   2,
+   4,
+   8,
+   12
+  ],
+  "V2": [
+   210.7,
+   302.0,
+   412.4,
+   484.8,
+   375.2
+  ],
+  "V3": [
+   221.0,
+   348.8,
+   477.2,
+   577.7,
+   659.9
+  ],
+  "source": "docs/measurements.md, README run (2026-11-20): bench/final.py, one boot each, 3 runs per cell, greedy, 512 tokens, t/s from the first token"
+ },
+ "prompt_resume": {
+  "title": "Resending a ~100k-token prompt: time to first token (V3)",
+  "cases": [
+   "evicted from VRAM",
+   "after a server restart"
+  ],
+  "series": {
+   "full re-prefill (what V2 does)": [
+    16.75,
+    16.75
+   ],
+   "V3 prompt-cache tiers": [
+    0.43,
+    0.76
+   ]
+  },
+  "source": "docs/measurements.md, README run: bench/prompt_cache.py on V3 as shipped. Re-prefill = the same prompt sent cold (16.75 s); V2 has no RAM or disk tier, so an evicted or pre-restart prompt is prefilled again."
+ }
+}

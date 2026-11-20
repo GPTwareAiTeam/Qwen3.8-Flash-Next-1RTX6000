@@ -5,67 +5,121 @@ Serving recipe for `Qwen/Qwen3.8-Flash-Next` in EXL3 `3.18bpw_h6_ng8`
 on a single 96 GiB RTX PRO 6000 Blackwell (SM120), with TabbyAPI, a 21-patch exllamav3, the DFlash2 drafter, a
 3M-token shared KV pool, up to 512k tokens per request and 12 concurrent requests.
 
-This is V3. It improves on V2, the previous release of this repo, the baseline in the tables below. All numbers are
-V3 as shipped (YaRN factor 2) unless a row says "YaRN factor 4".
+## V3 at a glance
 
-|Users|V2|V3|Change|
+|What|V2|V3|Change|
 |---|---|---|---|
-|1|207.5 t/s|**216.6 t/s**¹|+4.4 %|
-|2|302.5|**360.9**¹|+19.3 %|
-|4|392.6|**486.4**|+23.9 %|
-|8|472.2|**610.6**¹|+29.3 %|
-|12|375.9|**645.9**|**+71.8 %**|
-|KV cache (shared pool)|2,999,808 tokens, allocated at load|**2,999,808 tokens, mapped as it fills**|VRAM after load 93.9 → 60.7 GiB|
-|Max per request|655,360|524,032|12 requests share the pool|
+|Resend a 100k-token prompt after it was evicted from VRAM|16.75 s (prefilled again)¹|**0.43 s**|**39× faster**|
+|Resend it after a server restart|16.75 s (prefilled again)¹|**0.76 s**|**22× faster**|
+|12 users, code (`matrix.py`)|573.1 t/s²|**901.3 t/s**|**1.57×**|
+|8 users, code (`matrix.py`)|708.4 t/s|**881.5 t/s**|1.24×|
+|Requests served at once|9|**12**|+3|
+|1 user rewriting a ~1.5k-token file with one change|261.6 t/s|**355.9-399.9 t/s**|**+36-53 %**³|
+|VRAM after load|91.8 GiB (pool allocated)|**59.2 GiB** (pool mapped as it fills)|−32.6 GiB|
+|VRAM free at the run's peak|2.6 GiB|**6.9 GiB**|+4.3 GiB|
+|Cold 520k-token prompt to first token|96.6 s|**87.9 s**|1.10×|
+|Exact-answer probe (50 questions)|50/50|**50/50**|unchanged|
 
-Aggregate decode, geometric mean over prose, chat, code and math prompts; 512 generated tokens per request, greedy,
-tokens/s from each stream's first token (`bench/final.py`). Every comparison alternates server boots A, A, B, B on
-the same card, three runs per boot, medians. The 4- and 12-user rows are V2 against V3 as shipped, measured directly.
-¹ 1, 2 and 8 users come from a V2-against-V3 run with V3 at YaRN factor 4 (215.3 / 348.4 / 586.0 t/s) times the
-measured factor-4 → factor-2 change (+0.6 / +3.6 / +4.2 %, its own A, A, B, B): projections, not direct end-to-end
-runs.
+¹ V2 has no RAM or disk prompt-cache tier; the V2 column is the same prompt sent cold (measured on V3, same prefill path).
+² V2 serves at most 9 requests at once; at 12 users, 3 wait in its queue (as measured).
+³ Two single runs at different host load (2.5 and 5.0).
 
-This is a geometric mean over four prompt types, so it is **not** comparable with v2.0's headline (305.3 t/s at one
-user, which was a single code prompt); for V2's own metric see the `matrix.py` table below. The V2 column here is V2
-re-measured with this harness and prompt set, not copied from the v2.0 release page.
+**Since v1** (the original recipe: stock exllamav3, 8-bit KV): 8 users, code 453.7 → 881.5 t/s (1.94×); 1 user,
+code 231.1 → 313.5 t/s (1.36×).⁴
 
-|Decode, 2048 forced tokens from a short prompt|V2, greedy|V3, greedy|Change|V3, `qwen38_thinking` preset|
+⁴ `bench/matrix.py`, same card, harness and prompt; v1 and V3 measured in separate sessions.
+
+![Total decode throughput, V2 vs V3, 1-12 users](docs/img/throughput.svg)
+
+![Resending a ~100k-token prompt: time to first token](docs/img/prompt_resume.svg)
+
+Every number above and below is from `docs/measurements.md` (section "README run" unless noted); V3 is as shipped,
+YaRN factor 2.
+
+## Measured, V2 against V3
+
+**Same harness as the V2 release** (`bench/matrix.py`: 512-token greedy replies, send to last token, total t/s,
+median of 3; one boot per release):
+
+|`matrix.py`|1 user|8 users|12 users|
+|---|---|---|---|
+|V2, code|313.0 t/s|708.4|573.1²|
+|V3, code|313.5|**881.5**|**901.3**|
+|change|+0.2 %|+24.4 %|**+57.3 %**|
+|V2, math|297.6|684.7|559.8²|
+|V3, math|297.5|**805.2**|**844.5**|
+|change|−0.0 %|+17.6 %|**+50.9 %**|
+
+**Per prompt type, 1-12 users** (`bench/final.py`: 512 forced tokens per request, greedy, t/s from each stream's
+first token, median of 3, one boot per release):
+
+|Users|Prompt|V2 total|V3 total|Change|V2 per user|V3 per user|
+|---|---|---|---|---|---|---|
+|1|prose|144.6|**149.2**|+3.2 %|144.6|149.2|
+|1|chat|175.0|**189.4**|+8.2 %|175.0|189.4|
+|1|code|241.3|**256.9**|+6.5 %|241.3|256.9|
+|1|math|323.0|**328.4**|+1.7 %|323.0|328.4|
+|2|prose|211.8|**237.6**|+12.2 %|106.8|120.6|
+|2|chat|256.5|**289.8**|+13.0 %|129.6|147.5|
+|2|code|331.4|**393.3**|+18.7 %|170.4|206.4|
+|2|math|461.7|**546.5**|+18.4 %|235.1|273.4|
+|4|prose|289.4|**341.1**|+17.9 %|72.8|89.7|
+|4|chat|365.5|**391.9**|+7.2 %|92.4|105.4|
+|4|code|455.0|**575.1**|+26.4 %|118.3|154.6|
+|4|math|601.1|**674.2**|+12.2 %|157.7|190.5|
+|8|prose|339.3|**419.4**|+23.6 %|46.9|58.2|
+|8|chat|402.1|**487.5**|+21.2 %|55.5|69.1|
+|8|code|544.7|**664.6**|+22.0 %|78.5|103.8|
+|8|math|743.0|**819.5**|+10.3 %|105.5|133.2|
+|12|prose|273.4|**510.5**|+86.7 %|33.7|50.7|
+|12|chat|324.2|**587.2**|+81.1 %|39.8|58.9|
+|12|code|425.5|**768.0**|+80.5 %|52.6|80.9|
+|12|math|525.6|**823.5**|+56.7 %|71.9|95.0|
+
+Geometric mean over the four prompts, total t/s: 1 user 210.7 → 221.0 (+4.9 %), 2 users 302.0 → 348.8 (+15.5 %),
+4 users 412.4 → 477.2 (+15.7 %), 8 users 484.8 → 577.7 (+19.2 %), 12 users 375.2 → 659.9 (**+75.9 %**).⁵
+
+⁵ One boot per release; single cells vary up to ±15 % between runs at 4-8 users (run ranges in `docs/measurements.md`).
+
+**Prefill, cold prompt → first token** (fresh nonce each time):
+
+|Prompt|V2|V3|Change|
+|---|---|---|---|
+|~2k tokens|0.57 s (3,541 t/s)⁶|0.59 s (3,438 t/s)|−3 %|
+|32k|5.53 s (5,695 t/s)|**5.31 s (5,933 t/s)**|+4.2 %|
+|128k|23.1 s (5,683 t/s)⁶|**21.7 s (6,038 t/s)**|+6.2 %|
+|520k|96.6 s (5,385 t/s)|**87.9 s (5,915 t/s)**|+9.8 %|
+|worst of 5 cold 32k requests|—|5.61 s (median 5.19 s)| |
+
+⁶ V2's 2k and 128k from the release run's A, A, B, B (same harness); V3 from this README run.
+
+**Prompt cache, ~100k-token prompt** (V3; `bench/prompt_cache.py`):
+
+|Case|V3 time to first token|Tokens served from cache|
+|---|---|---|
+|sent cold|16.75 s|0|
+|resent at once (pages in VRAM)|0.18 s|99,840 of 99,997|
+|resent after 3.1M tokens of other prompts evicted it from VRAM (RAM tier)|**0.43 s**|99,840|
+|resent after a server restart (disk tier)|**0.76 s**|99,840|
+
+**One request at a time, 2048 forced tokens** (`bench/decode_natural.py`, median of 3, one boot per release):
+
+|Prompt|V2, greedy|V3, greedy|Change|V3, `qwen38_thinking` preset⁷|
 |---|---|---|---|---|
 |prose|127.3 t/s|127.4 t/s|+0.1 %|123.4 t/s|
 |code|289.1|**306.8**|+6.1 %|276.4|
 |chat|155.8|152.1|−2.4 %|152.3|
 |math|319.8|**329.3**|+3.0 %|321.2|
 
-One request at a time, so most of V3's gains (which are in batching) don't show; prose and chat are within run-to-run
-noise. `bench/decode_natural.py`, one run of three repeats per release. The preset is the shipped
-`qwen38_thinking` sampling (temperature 0.6, top-k 20, top-p 0.95): sampled tokens accept fewer drafts, so it is
-0-10 % slower than greedy.
+⁷ Temperature 0.6, top-k 20, top-p 0.95: this repo's choice (Qwen recommends temperature 1.0 for thinking mode);
+clients that send their own sampling settings keep them.
 
-The V2 column is V2 re-measured in the same session; the figures on the v2.0 release page were 125.8 / 287.3 / 156.1
-/ 313.8 t/s, within the run-to-run spread of these.
+**Quality:** 50/50 on the exact-answer probe for both releases (`bench/accuracy.py`); a passphrase planted halfway
+into a 520k-token prompt is retrieved; next-token top-1 agreement with V2 25/25 (16 short, 9 long prompts up to 157k)
+with KL 0.0010-0.0014 short and 0.0018 long against a V2-vs-V2 floor of 0.0004 / 0.0000 (YaRN factor 4);⁸ YaRN
+factor 2 against factor 4: top-1 16/16, KL 0.015 (the position encoding itself changes).
 
-|Prefill, cold prompt → 1 token|V2|V3|V3 time to first token|
-|---|---|---|---|
-|~2k tokens|3,541 t/s|3,284 t/s (YaRN factor 4)|0.62 s|
-|32k|5,660 t/s|**5,990 t/s** (factor 4); 5,933 t/s (factor 2)|5.3-5.5 s|
-|128k|5,683 t/s|**5,949 t/s** (factor 4)|22.0 s|
-|520k|5,385 t/s (96.6 s)|**5,915 t/s (87.9 s)**|88 s|
-|worst of 5 cold 32k requests|—|5.61 s (median 5.19 s)||
-
-2k/32k/128k: A, A, B, B of V2 against V3 at YaRN factor 4, three runs per boot; the factor-2 32k figure is one run
-with V2 in the same session. 520k: one cold request each, V3 at factor 2. Long prompts gain because the growable
-pool leaves room for 16k-token chunks; short prompts pay ~0.05 s for the per-chunk memory check.
-
-The V2 column is V2 re-measured in the same session; v2.0 published 3,475 / 5,690 / 5,647 / 5,294 t/s (520k in
-98.3 s), within the run-to-run spread of these.
-
-Quality, V3 as shipped unless noted: **50/50** on the exact-answer probe (`bench/accuracy.py`, V2 50/50); a passphrase
-planted halfway into a 520k-token prompt is retrieved; next-token agreement with V2 (YaRN factor 4, 16 short and 9
-long prompts up to 157k) is top-1 25/25 with KL 0.0010-0.0014 short and 0.0018 long, against a V2-vs-V2 floor of
-0.0004 / 0.0000; an evicted 100k prompt returns in **0.44 s** (RAM tier, V2: a full ~17 s prefill) and in **0.87 s**
-after a server restart (NVMe tier); 6.6 GiB of VRAM stays free at peak (V2: 1.0 GiB). Factor 2 against factor 4:
-top-1 16/16 and KL 0.015 mean — the position encoding itself changes, as intended. Details and per-cell tables:
-`docs/measurements.md`.
+⁸ Rounding-level drift from patch 0017 and the adaptive prefill chunks; details under "Trade-offs".
 
 ## What it takes
 
@@ -124,42 +178,36 @@ TABBY=$PWD/tabbyAPI ENGINE=$PWD/exllamav3 GPU=0 ./deploy/launch.sh
 `launch.sh` sets the engine switches, waits for the model and sends one 128-token warm-up request before serving
 (see "Server history"). Startup takes ~80-90 s: the 192 GiB RAM tier is committed and page-locked at load.
 
-## What changed against V2
+## What's new in V3
 
-|Change|Where|Measured effect|Numerics|
-|---|---|---|---|
-|12 concurrent requests: decode graphs for 12 jobs, a 64-row cap on verify rows per round, and the fix for the cap reading the batch size from the draft buffer (it had cut every round to 4 drafts)|0019, 0021, `max_batch_size: 12`, `EXL3_DRAFT_MAX_ROWS=64`|12 users 1.7× V2; cap-fix alone: 1 user math 254 → 335 t/s|lossless (draft width only)|
-|Growable KV pool: the 3M-token pool reserved as CUDA virtual memory, mapped in 256-page steps, released from the top when the queue drains|0010-0015, `EXL3_KV_GROW=1`|VRAM after load 93.9 → 60.7 GiB; the freed room goes to prefill|lossless (same pages, mapped on demand)|
-|Adaptive prefill chunks up to 16k sized to free memory; TabbyAPI patch v3 adds `prefill_chunk_size`, `shared_chunk_size`, `prefill_cooldown`|0006 (now on), 0010, 0013, 0014, `prefill_chunk_size: 16384`|cold 32k +6-8 %, 128k +5-9 %, 2k −2..−7 %|rounding-level (chunk boundaries move with free memory)|
-|Prompt-cache RAM (192 GiB pinned) and NVMe tiers|`memory.sysmem_kv_cache`, `disk_cache_dir`, `disk_cache_size`|evicted 100k prompt: 17 s → **0.44 s**; after a restart **0.87 s**|bit-identical (cached pages)|
-|Hyper-connection int8 tables built once at load instead of per call (above 8 rows)|0016, `EXL3_HC_TABLE_CACHE=1`|8 users +9-11 %; +1.3 GiB VRAM|bit-identical|
-|Shared expert of a wide verify window as one launch|0017, `EXL3_MOE_SHARED_WIDE=1`|8 users +7 %|rounding-level|
-|Batched speculative accept: one readback per round, rewinds settled in one batch (incl. the TabbyAPI sampler flag that had kept it from engaging)|0018, `EXL3_SD_BATCH_ACCEPT=1`|8 users +6-8 %|lossless|
-|Drafter's next block launched under the host accept loop; hybrid (suffix-match) drafting of 16 tokens while exactly one request is active|0021, `EXL3_SD_DRAFT_OVERLAP=1`, `hybrid_draft_tokens: 16`|8 users prose +4.6 %; 1 user rewriting a ~1.5k-token file +36-53 %|lossless|
-|Counting-sort run table for wide verify windows|0020, `EXL3_MOE_COOP_FAST_RUNS=1`|rotation launch 50-60 → 8-9 µs at 56-64 rows|bit-identical|
-|YaRN factor 4 → 2 (524,288 positions); per-request limit 655,360 → 524,032|`deploy/model-config-yarn2.patch`, `max_seq_len: 524032`|1/2/8 users +0.6/+3.6/+4.2 % (A, A, B, B), mostly on code|changes the position encoding: short-prompt KL 0.015 vs factor 4|
-|Bench: first-token timing, the release benchmark, needle and prompt-cache harnesses; gate policy = next-token top-1 + KL against the run-to-run noise floor|`bench/timing.py`, `final.py`, `needle.py`, `prompt_cache.py`|every V3 number uses them|—|
+|Change|Ships in|Measured effect (that change alone)|
+|---|---|---|
+|12 concurrent requests: decode graphs for 12 jobs, a 64-row cap on verify rows per round, and the cap's batch-size fix|0019, 0021, `max_batch_size: 12`|12 users 1.57× V2 (`matrix.py`, code); the fix alone: 1 user math 254 → 335 t/s|
+|Prompt-cache RAM (192 GiB) and NVMe tiers|`memory.sysmem_kv_cache`, `disk_cache_dir`|evicted 100k prompt 16.75 → 0.43 s; after a restart 0.76 s|
+|Growable KV pool|0010-0015|VRAM after load 91.8 → 59.2 GiB|
+|Adaptive prefill chunks up to 16k + TabbyAPI patch v3|0006, 0013, 0014, `prefill_chunk_size: 16384`|cold 128k +5-9 %, 2k −3..−7 %|
+|Hyper-connection int8 tables built once|0016|8 users +9-11 %|
+|Shared expert of a wide verify window as one launch|0017|8 users +7 %|
+|Batched speculative accept (+ the no-op sampler flag fix)|0018|8 users +6-8 %|
+|Drafter's next block under the host accept loop|0021, `EXL3_SD_DRAFT_OVERLAP=1`|8 users prose +4.6 % (one run)|
+|Hybrid (suffix-match) drafting while one request is active|0021, `hybrid_draft_tokens: 16`|1 user file rewrite +36-53 % (one run each)|
+|Counting-sort run table for wide verify windows|0020|rotation launch 50-60 → 8-9 µs|
+|YaRN factor 4 → 2, 512k per request|`deploy/model-config-yarn2.patch`|1 / 2 / 8 users +0.6 / +3.6 / +4.2 %|
+|Bench: first-token timing, release benchmark, needle, prompt-cache and chat exact-answer probes; gate policy|`bench/`|—|
 
-In the series but not enabled by `launch.sh` (measured, no gain on this stack, or diagnostics only): the speculative
-host readbacks of 0008 (`EXL3_SD_DEFER_DRAFT_CONF`, `EXL3_SD_BATCH_READBACK`, `EXL3_SD_WINDOW_BATCH`; subsumed by
-0018), the split down-stage reduction of 0020 (`EXL3_MOE_COOP_SPLIT_B`, slower end to end) and the diagnostics of
-0009. Shipped in V2 and unchanged: 0001-0007 (the dense DGEMV of 0002 stays off). Per-change A/Bs, one boot per arm
-where marked, and the numbers behind each row: `docs/measurements.md`.
+Numerics, switches and the measurements behind each row: `engine/README.md` and `docs/measurements.md`
+("What's new in V3, per item").
 
 ## Trade-offs
 
-- **Host RAM ~250 GiB.** The prompt-cache RAM tier dominates. Lower `sysmem_kv_cache` (sized in MB; 192 GiB holds
-  ~15M tokens of evicted KV at 13.5 KiB per token) to fit a smaller host, or set it to 0 to drop both cache tiers.
-- **Rounding-level drift.** Patch 0017 and the adaptive chunks change floating-point summation order: greedy text
-  differs from V2 on 3-5 of the 8 identity prompts at near-tie tokens (V2 against itself: 7/8; V3 against itself:
-  6/8). Next-token top-1 stays 25/25, KL stays 0.001-0.002, the exact-answer probe is 50/50 on both releases.
-- **YaRN factor 2.** 512k per request instead of 640k. The model was trained at 262,144 positions and the drafter
-  without YaRN, so the smaller factor drafts slightly better. For longer single requests, set `"factor": 4.0`,
-  `"max_position_embeddings": 1048576` and `max_seq_len` ≥ 655,360 (V2's setting).
-- **Cold 2k prefill −7 %**: the adaptive limiter queries free memory per chunk (0.57 → 0.62 s). Long prompts gain.
-- **12 users share the verify budget**: 7 → 6-4 drafts per round, so per-user speed falls (8 users 84.8, 12 users
-  68.7 t/s) while total throughput rises.
-- **Slower start**: ~80-90 s to ready (V2 ~45 s), because the RAM tier is page-locked at load.
+- **Host RAM ~250 GiB** for the 192 GiB prompt-cache RAM tier; lower or zero `sysmem_kv_cache` on a smaller host.
+- **Rounding-level drift**: greedy text differs from V2 at near-tie tokens; next-token top-1 25/25, KL 0.001-0.002.
+- **512k per request** instead of 640k (YaRN factor 2); factor 4 restores 640k+ at some single-user speed.
+- **Cold 2k prefill 3-7 % slower** (0.57 → 0.59-0.62 s); long prompts gain.
+- **Per-user speed above 8 users** falls (12 users: 69 t/s each) while total throughput rises.
+- **Slower start**: ~80-90 s to ready (V2 ~45 s), the RAM tier is page-locked at load.
+
+Details for each: `docs/measurements.md`.
 
 ## Details
 
@@ -169,8 +217,9 @@ positions.
 
 **Context length.** `deploy/model-config-yarn2.patch` applies static YaRN factor 2 (524,288 positions);
 `max_seq_len: 524032` leaves one 256-token page for the draft and verify positions of a request at the limit
-(drafts are up to 16 tokens with hybrid drafting). V2 used factor 4 (1,048,576 positions, 640k per request). The
-per-cell factor-4 → factor-2 comparison is in `docs/measurements.md`.
+(drafts are up to 16 tokens with hybrid drafting). V2 used factor 4 (1,048,576 positions, 640k per request); the
+smaller factor drafts slightly better because the drafter was trained without YaRN (`docs/measurements.md`,
+"YaRN factor 4 → 2").
 
 **KV capacity.** 6-bit K/V costs 13.5 KiB per token; 3.75 KiB of that is fixed fp16 planes for the sparse-attention
 indexer. The 3M-token pool (2,999,808, a multiple of 256) is reserved as virtual memory at load and mapped in
@@ -215,13 +264,14 @@ If you front the server with a router or gateway:
 
 **Admission.** `max_batch_size` is 12. The batched-cache decode graphs cover up to 12 jobs (patch 0019) and the
 verify-row cap (`EXL3_DRAFT_MAX_ROWS=64`) trims each round's draft width so 9-12 jobs stay inside the 64-row
-captured paths: 8 jobs keep the full 7 drafts, 9-12 jobs get 6-4. With 12 users the GPU serves 1.7× V2's total
-throughput, and each user still gets ~65-70 t/s. VRAM after load is 60.7 GiB with the growable KV pool.
+captured paths: 8 jobs keep the full 7 drafts, 9-12 jobs get 6-4. With 12 users V3 serves 1.57× V2's total on
+`matrix.py` code (+75.9 % on the four-prompt mean) and each user still gets ~69 t/s. VRAM after load is 59.2 GiB
+with the growable KV pool.
 
 **Server history.** With the drafter attached, a freshly started server's first ~74 decoded tokens can differ
 slightly from later requests; for example a raw `2+2=` as the very first request can complete with 5 instead of 4.
 The launcher's 128-token warm-up absorbs this. More generally, greedy text on this stack can depend slightly on
-what the server has decoded since start (near-tie tokens; batched KL 0.0015). v1 behaves the same way.
+what the server has decoded since start (near-tie tokens; batched KL 0.0015). V2 behaves the same way.
 
 **Prefill while others decode.** A new prompt shares the GPU with running decodes: by default it takes one
 4096-token chunk every fifth generator step. With four users decoding, a cold 131k prompt reaches its first token
@@ -245,10 +295,12 @@ waiting; raise it where streaming users must stay smooth.
 ```
 deploy/   launch.sh, config.yml, YaRN config patch, TabbyAPI patch v3
 engine/   exllamav3 patch series (21 patches) and its README
-bench/    the harnesses behind the tables: final.py (decode / prefill with first-token timing), prompt_cache.py,
-          needle.py, identity_kl.py, accuracy.py (chat, exact answer), accuracy_raw.py (V2's probe), prefill under load, the fill/drain soak, the nsys prefill profiler
-docs/     measurements.md: per-change A/B results, per-cell tables and how they were measured;
-          provenance.md: where each V3 item comes from
+bench/    the harnesses behind the tables: matrix.py (V2's headline method), final.py (decode / prefill with
+          first-token timing), decode_natural.py (2048-token single requests), prompt_cache.py, needle.py,
+          coldttft.py, accuracy.py (chat, exact answer), accuracy_raw.py (V2's probe), identity_kl.py, prefill under
+          load, the fill/drain soak, the nsys prefill profiler
+docs/     measurements.md: every number in this README and how it was measured, per-change A/B results;
+          provenance.md: where each V3 item comes from; img/: the two charts and the script that draws them
 ```
 
 Run the benchmarks against a running server, e.g.
