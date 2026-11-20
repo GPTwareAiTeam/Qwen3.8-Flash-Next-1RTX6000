@@ -25,6 +25,10 @@ the same card, three runs per boot, medians. The 4- and 12-user rows are V2 agai
 measured factor-4 → factor-2 change (+0.6 / +3.6 / +4.2 %, its own A, A, B, B): projections, not direct end-to-end
 runs.
 
+This is a geometric mean over four prompt types, so it is **not** comparable with v2.0's headline (305.3 t/s at one
+user, which was a single code prompt); for V2's own metric see the `matrix.py` table below. The V2 column here is V2
+re-measured with this harness and prompt set, not copied from the v2.0 release page.
+
 |Decode, 2048 forced tokens from a short prompt|V2, greedy|V3, greedy|Change|V3, `qwen38_thinking` preset|
 |---|---|---|---|---|
 |prose|127.3 t/s|127.4 t/s|+0.1 %|123.4 t/s|
@@ -37,6 +41,9 @@ noise. `bench/decode_natural.py`, one run of three repeats per release. The pres
 `qwen38_thinking` sampling (temperature 0.6, top-k 20, top-p 0.95): sampled tokens accept fewer drafts, so it is
 0-10 % slower than greedy.
 
+The V2 column is V2 re-measured in the same session; the figures on the v2.0 release page were 125.8 / 287.3 / 156.1
+/ 313.8 t/s, within the run-to-run spread of these.
+
 |Prefill, cold prompt → 1 token|V2|V3|V3 time to first token|
 |---|---|---|---|
 |~2k tokens|3,541 t/s|3,284 t/s (YaRN factor 4)|0.62 s|
@@ -48,6 +55,9 @@ noise. `bench/decode_natural.py`, one run of three repeats per release. The pres
 2k/32k/128k: A, A, B, B of V2 against V3 at YaRN factor 4, three runs per boot; the factor-2 32k figure is one run
 with V2 in the same session. 520k: one cold request each, V3 at factor 2. Long prompts gain because the growable
 pool leaves room for 16k-token chunks; short prompts pay ~0.05 s for the per-chunk memory check.
+
+The V2 column is V2 re-measured in the same session; v2.0 published 3,475 / 5,690 / 5,647 / 5,294 t/s (520k in
+98.3 s), within the run-to-run spread of these.
 
 Quality, V3 as shipped unless noted: **50/50** on the exact-answer probe (`bench/accuracy.py`, V2 50/50); a passphrase
 planted halfway into a 520k-token prompt is retrieved; next-token agreement with V2 (YaRN factor 4, 16 short and 9
